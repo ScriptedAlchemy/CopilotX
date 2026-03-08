@@ -38,12 +38,27 @@ REQUEST_TIMEOUT = 120  # seconds
 
 # ── Security ───────────────────────────────────────────────────────
 # Set COPILOTX_API_KEY env var to enable API key protection.
-# When set: localhost is exempt, remote requests require Bearer token.
+# Set COPILOTX_TRUST_LOCALHOST=0 to require auth even from localhost.
+# When set: remote requests require Bearer token.
 # When unset: all requests are allowed (backward compatible).
-COPILOTX_API_KEY = os.environ.get("COPILOTX_API_KEY", "")
 LOCALHOST_ADDRS = {"127.0.0.1", "::1", "localhost"}
 # Paths that are always accessible without API key (health checks, etc.)
 PUBLIC_PATHS = {"/health", "/"}
+
+_FALSEY_ENV_VALUES = {"0", "false", "no", "off"}
+
+
+def get_copilotx_api_key() -> str:
+    """Return the configured API key for incoming client authentication."""
+    return os.environ.get("COPILOTX_API_KEY", "").strip()
+
+
+def trust_localhost() -> bool:
+    """Return whether localhost callers bypass API key checks."""
+    raw = os.environ.get("COPILOTX_TRUST_LOCALHOST", "1").strip().lower()
+    if not raw:
+        return True
+    return raw not in _FALSEY_ENV_VALUES
 
 # ── Token ──────────────────────────────────────────────────────────
 TOKEN_REFRESH_BUFFER = 60  # refresh token 60s before expiry
@@ -56,4 +71,13 @@ MODELS_CACHE_TTL = 300  # 5 minutes
 # ── Storage ────────────────────────────────────────────────────────
 COPILOTX_DIR = Path.home() / ".copilotx"
 AUTH_FILE = COPILOTX_DIR / "auth.json"
+ACCOUNTS_DB_FILE = COPILOTX_DIR / "accounts.db"
 SERVER_FILE = COPILOTX_DIR / "server.json"
+
+# ── Multi-Account Rotation ─────────────────────────────────────────
+DEFAULT_ROTATION_STRATEGY = "fill-first"
+ROTATION_STRATEGIES = {"fill-first", "round-robin"}
+POOL_SYNC_INTERVAL = 5  # seconds
+POOL_429_COOLDOWN = 60  # seconds
+POOL_FAILURE_COOLDOWN = 15  # seconds
+POOL_MAX_RETRY_ATTEMPTS = 3

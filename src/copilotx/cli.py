@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-import os
+import hashlib
+import time
 from typing import Optional
 
 import typer
@@ -25,6 +26,117 @@ app.add_typer(auth_app, name="auth")
 console = Console()
 
 
+def _account_repository():
+    from copilotx.auth.accounts import AccountRepository
+
+    return AccountRepository()
+
+
+def _enabled_accounts(repo) -> list:
+    return [account for account in repo.list_accounts() if account.enabled]
+
+
+def _has_pool_accounts(repo) -> bool:
+    return bool(_enabled_accounts(repo))
+
+
+def _format_duration(seconds: int) -> str:
+    seconds = max(int(seconds), 0)
+    mins, secs = divmod(seconds, 60)
+    hours, mins = divmod(mins, 60)
+    if hours:
+        return f"{hours}h {mins}m"
+    if mins:
+        return f"{mins}m {secs}s"
+    return f"{secs}s"
+
+
+def _render_account_table(repo) -> None:
+    from copilotx.config import TOKEN_REFRESH_BUFFER
+
+    accounts = repo.list_accounts()
+    if not accounts:
+        console.print("[bold red]❌ Not authenticated[/]")
+        console.print("[dim]   Run: copilotx auth login[/]")
+        raise typer.Exit(1)
+
+    now = time.time()
+    default_account_id = repo.get_default_account_id()
+    strategy = repo.get_rotation_strategy()
+    console.print(f"[bold green]✅ {len(accounts)} account(s) configured[/]")
+    console.print(f"[dim]   Rotation strategy: {strategy}[/]")
+
+    table = Table(title="🔐 Upstream Accounts", show_lines=False)
+    table.add_column("Account", style="cyan", no_wrap=True)
+    table.add_column("GitHub", style="white")
+    table.add_column("State", style="white")
+    table.add_column("Token", style="dim")
+    table.add_column("Priority", style="dim", justify="right")
+
+    for account in accounts:
+        is_valid = (
+            bool(account.copilot_token)
+            and account.expires_at > now + TOKEN_REFRESH_BUFFER
+        )
+        token_state = (
+            f"valid {_format_duration(int(account.expires_at - now))}"
+            if is_valid
+            else "expired"
+        )
+        if not account.copilot_token:
+            token_state = "not fetched"
+
+        state = "ready"
+        if not account.enabled:
+            state = "disabled"
+        elif account.reauth_required:
+            state = "reauth required"
+        elif account.last_error:
+            state = "degraded"
+
+        account_name = account.display_name
+        if account.account_id == default_account_id:
+            account_name = f"{account_name} *"
+
+        table.add_row(
+            account_name,
+            account.github_login or "legacy",
+            state,
+            token_state,
+            str(account.priority),
+        )
+
+    console.print(table)
+
+
+def _load_models_via_pool(repo):
+    from copilotx.auth.pool import TokenPool
+
+    async def _fetch():
+        async with TokenPool(repo) as pool:
+            models = await pool.list_models()
+            health = await pool.health_snapshot()
+            return models, health
+
+    return asyncio.run(_fetch())
+
+
+def _load_models_via_legacy():
+    from copilotx.auth.token import TokenManager
+    from copilotx.proxy.client import CopilotClient
+
+    tm = TokenManager()
+    if not tm.is_authenticated:
+        raise RuntimeError("Not authenticated. Run: copilotx auth login")
+
+    async def _fetch():
+        token = await tm.ensure_copilot_token()
+        async with CopilotClient(token) as client:
+            return await client.list_models()
+
+    return asyncio.run(_fetch())
+
+
 # ── Auth commands ───────────────────────────────────────────────────
 
 
@@ -36,14 +148,19 @@ def auth_login(
         "-t",
         help="GitHub token (skip OAuth flow). Can also set GITHUB_TOKEN env var.",
     ),
+    label: Optional[str] = typer.Option(
+        None,
+        "--label",
+        "-l",
+        help="Optional local label for this account.",
+    ),
 ) -> None:
     """Authenticate with GitHub Copilot."""
     import os
 
-    from copilotx.auth.oauth import OAuthError, device_flow_login
-    from copilotx.auth.token import TokenError, TokenManager
-
-    tm = TokenManager()
+    from copilotx.auth.accounts import AccountRecord
+    from copilotx.auth.oauth import OAuthError, device_flow_login, fetch_github_user
+    from copilotx.auth.token import TokenError, fetch_copilot_token
 
     # Determine GitHub token source
     github_token = token or os.environ.get("GITHUB_TOKEN")
@@ -61,25 +178,65 @@ def auth_login(
             console.print(f"[bold red]❌ Unexpected error:[/] {e}")
             raise typer.Exit(1)
 
-    # Save the GitHub token
-    tm.save_github_token(github_token)
+    repo = _account_repository()
 
-    # Verify by fetching a Copilot token
     try:
-        asyncio.run(tm.ensure_copilot_token())
+        github_user = asyncio.run(fetch_github_user(github_token))
+    except Exception as e:
+        fingerprint = hashlib.sha256(github_token.encode("utf-8")).hexdigest()[:12]
+        fallback_login = label or f"account-{fingerprint[:6]}"
+        console.print(f"[yellow]⚠️  Could not fetch GitHub identity: {e}[/]")
+        github_user_id = fingerprint
+        github_login = fallback_login
+    else:
+        github_user_id = github_user.user_id or github_user.login
+        github_login = github_user.login or (label or "account")
+
+    try:
+        copilot_token, expires_at, api_base_url = asyncio.run(
+            fetch_copilot_token(github_token)
+        )
     except TokenError as e:
         console.print(f"[bold red]❌ Copilot token exchange failed:[/] {e}")
         raise typer.Exit(1)
 
+    account_id = f"github-{github_user_id}"
+    existing_account = repo.get_account(account_id)
+    account = AccountRecord(
+        account_id=account_id,
+        github_login=github_login,
+        github_user_id=str(github_user_id),
+        label=label or github_login,
+        github_token=github_token,
+        copilot_token=copilot_token,
+        expires_at=expires_at,
+        api_base_url=api_base_url,
+        enabled=True,
+        reauth_required=False,
+        priority=existing_account.priority if existing_account else 0,
+        model_ids=existing_account.model_ids if existing_account else [],
+        last_used_at=existing_account.last_used_at if existing_account else 0.0,
+        created_at=existing_account.created_at if existing_account else 0.0,
+    )
+    saved = repo.upsert_account(account)
+
     console.print()
     console.print("[bold green]✅ Successfully authenticated with GitHub Copilot![/]")
-    console.print(f"[dim]   Credentials saved to {tm.storage.path}[/]")
-    console.print(f"[dim]   Copilot token expires in {tm.expires_in_seconds // 60} minutes[/]")
+    console.print(f"[dim]   Account: {saved.display_name} ({saved.github_login})[/]")
+    expires_in = _format_duration(int(saved.expires_at - time.time()))
+    console.print(f"[dim]   Copilot token expires in {expires_in}[/]")
+    console.print(f"[dim]   Accounts DB: {repo.path}[/]")
+    console.print(f"[dim]   Rotation strategy: {repo.get_rotation_strategy()}[/]")
 
 
 @auth_app.command("status")
 def auth_status() -> None:
     """Show current authentication status."""
+    repo = _account_repository()
+    if repo.has_accounts():
+        _render_account_table(repo)
+        return
+
     from copilotx.auth.token import TokenManager
 
     tm = TokenManager()
@@ -101,9 +258,30 @@ def auth_status() -> None:
 
 
 @auth_app.command("logout")
-def auth_logout() -> None:
+def auth_logout(
+    account: Optional[str] = typer.Argument(
+        None,
+        help="Optional account label/login/id to remove. Omit to remove all accounts.",
+    ),
+) -> None:
     """Remove stored credentials."""
     from copilotx.auth.token import TokenManager
+
+    repo = _account_repository()
+    if repo.has_accounts():
+        if account:
+            if repo.delete_account(account):
+                console.print(f"[bold green]✅ Removed account {account}[/]")
+            else:
+                console.print(f"[bold red]❌ Unknown account: {account}[/]")
+                raise typer.Exit(1)
+        else:
+            removed = repo.clear_accounts()
+            console.print(f"[bold green]✅ Removed {removed} account(s)[/]")
+
+        if not repo.has_accounts():
+            TokenManager().logout()
+        return
 
     tm = TokenManager()
     if tm.logout():
@@ -112,28 +290,73 @@ def auth_logout() -> None:
         console.print("[dim]No credentials found[/]")
 
 
+@auth_app.command("list")
+def auth_list() -> None:
+    """List all configured upstream accounts."""
+    auth_status()
+
+
+@auth_app.command("strategy")
+def auth_strategy(
+    strategy: Optional[str] = typer.Argument(
+        None,
+        help="Rotation strategy: fill-first or round-robin.",
+    ),
+) -> None:
+    """Get or set the upstream rotation strategy."""
+    from copilotx.config import ROTATION_STRATEGIES
+
+    repo = _account_repository()
+    if strategy is None:
+        console.print(repo.get_rotation_strategy())
+        return
+
+    if strategy not in ROTATION_STRATEGIES:
+        console.print(
+            f"[bold red]❌ Unknown strategy: {strategy}[/]\n"
+            f"[dim]   Available: {', '.join(sorted(ROTATION_STRATEGIES))}[/]"
+        )
+        raise typer.Exit(1)
+
+    repo.set_rotation_strategy(strategy)
+    console.print(f"[bold green]✅ Rotation strategy set to {strategy}[/]")
+
+
+@auth_app.command("enable")
+def auth_enable(account: str = typer.Argument(..., help="Account label/login/id")) -> None:
+    """Enable an upstream account."""
+    repo = _account_repository()
+    updated = repo.set_account_enabled(account, True)
+    if updated is None:
+        console.print(f"[bold red]❌ Unknown account: {account}[/]")
+        raise typer.Exit(1)
+    console.print(f"[bold green]✅ Enabled {updated.display_name}[/]")
+
+
+@auth_app.command("disable")
+def auth_disable(account: str = typer.Argument(..., help="Account label/login/id")) -> None:
+    """Disable an upstream account."""
+    repo = _account_repository()
+    updated = repo.set_account_enabled(account, False)
+    if updated is None:
+        console.print(f"[bold red]❌ Unknown account: {account}[/]")
+        raise typer.Exit(1)
+    console.print(f"[bold green]✅ Disabled {updated.display_name}[/]")
+
+
 # ── Models command ──────────────────────────────────────────────────
 
 
 @app.command("models")
 def list_models() -> None:
     """List available Copilot models."""
-    from copilotx.auth.token import TokenError, TokenManager
-    from copilotx.proxy.client import CopilotClient
-
-    tm = TokenManager()
-    if not tm.is_authenticated:
-        console.print("[bold red]❌ Not authenticated. Run: copilotx auth login[/]")
-        raise typer.Exit(1)
-
-    async def _fetch():
-        token = await tm.ensure_copilot_token()
-        async with CopilotClient(token) as client:
-            return await client.list_models()
-
+    repo = _account_repository()
     try:
-        models = asyncio.run(_fetch())
-    except TokenError as e:
+        if _has_pool_accounts(repo):
+            models, _ = _load_models_via_pool(repo)
+        else:
+            models = _load_models_via_legacy()
+    except RuntimeError as e:
         console.print(f"[bold red]❌ {e}[/]")
         raise typer.Exit(1)
     except Exception as e:
@@ -210,23 +433,22 @@ def config_client(
     from pathlib import Path
 
     from copilotx.auth.token import TokenError, TokenManager
-    from copilotx.proxy.client import CopilotClient
     from copilotx.config import COPILOTX_DIR
 
     # Target configs
-    TARGETS = {
+    targets = {
         "claude-code": {
             "name": "Claude Code",
             "config_path": Path.home() / ".claude" / "settings.json",
         },
     }
 
-    if target not in TARGETS:
+    if target not in targets:
         console.print(f"[bold red]❌ Unknown target: {target}[/]")
-        console.print(f"[dim]   Available: {', '.join(TARGETS.keys())}[/]")
+        console.print(f"[dim]   Available: {', '.join(targets.keys())}[/]")
         raise typer.Exit(1)
 
-    target_info = TARGETS[target]
+    target_info = targets[target]
     is_remote = base_url is not None
 
     # Determine base URL
@@ -234,21 +456,18 @@ def config_client(
         base_url = "http://localhost:24680"
 
     # Check authentication
-    tm = TokenManager()
-    if not tm.is_authenticated:
-        console.print("[bold red]❌ Not authenticated. Run: copilotx auth login[/]")
-        raise typer.Exit(1)
-
-    # Fetch models for validation and auto-selection
-    async def _fetch():
-        token = await tm.ensure_copilot_token()
-        async with CopilotClient(token) as client:
-            return await client.list_models()
-
+    repo = _account_repository()
     try:
-        models = asyncio.run(_fetch())
+        if _has_pool_accounts(repo):
+            models, _ = _load_models_via_pool(repo)
+        else:
+            tm = TokenManager()
+            if not tm.is_authenticated:
+                console.print("[bold red]❌ Not authenticated. Run: copilotx auth login[/]")
+                raise typer.Exit(1)
+            models = _load_models_via_legacy()
         model_ids = [m["id"] for m in models]
-    except (TokenError, Exception) as e:
+    except (TokenError, RuntimeError, Exception) as e:
         console.print(f"[yellow]⚠️  Could not fetch models: {e}[/]")
         model_ids = []
 
@@ -278,7 +497,10 @@ def config_client(
                         api_key = line.split("=", 1)[1].strip()
                         break
             if not api_key:
-                console.print("[bold red]❌ Remote mode requires --api-key or COPILOTX_API_KEY in ~/.copilotx/.env[/]")
+                console.print(
+                    "[bold red]❌ Remote mode requires --api-key or "
+                    "COPILOTX_API_KEY in ~/.copilotx/.env[/]"
+                )
                 raise typer.Exit(1)
         else:
             api_key = "copilotx"  # Local mode placeholder
@@ -332,27 +554,13 @@ def serve(
     port_explicit: bool = typer.Option(False, hidden=True),
 ) -> None:
     """Start the local API proxy server."""
-    import json
     import os
-    import signal
     import socket
     import sys
 
+    from copilotx.auth.pool import TokenPool
     from copilotx.auth.token import TokenError, TokenManager
-    from copilotx.config import COPILOTX_DIR, DEFAULT_PORT, SERVER_FILE
-    from copilotx.proxy.client import CopilotClient
-
-    tm = TokenManager()
-    if not tm.is_authenticated:
-        console.print("[bold red]❌ Not authenticated. Run: copilotx auth login[/]")
-        raise typer.Exit(1)
-
-    # Pre-validate token
-    try:
-        asyncio.run(tm.ensure_copilot_token())
-    except TokenError as e:
-        console.print(f"[bold red]❌ {e}[/]")
-        raise typer.Exit(1)
+    from copilotx.config import SERVER_FILE
 
     # Detect if --port was explicitly passed via sys.argv
     _port_was_explicit = any(
@@ -379,18 +587,36 @@ def serve(
             )
         port = actual_port
 
-    # Fetch models for display
-    try:
+    repo = _account_repository()
+    use_pool = _has_pool_accounts(repo)
+    pool_health: dict | None = None
+    runtime = None
 
-        async def _fetch():
-            token = await tm.ensure_copilot_token()
-            async with CopilotClient(token) as client:
-                return await client.list_models()
+    if use_pool:
+        try:
+            models, pool_health = _load_models_via_pool(repo)
+            model_names = [m["id"] for m in models]
+        except Exception:
+            model_names = ["(could not fetch)"]
+            pool_health = None
+        runtime = TokenPool(repo)
+    else:
+        tm = TokenManager()
+        if not tm.is_authenticated:
+            console.print("[bold red]❌ Not authenticated. Run: copilotx auth login[/]")
+            raise typer.Exit(1)
+        try:
+            asyncio.run(tm.ensure_copilot_token())
+        except TokenError as e:
+            console.print(f"[bold red]❌ {e}[/]")
+            raise typer.Exit(1)
 
-        models = asyncio.run(_fetch())
-        model_names = [m["id"] for m in models]
-    except Exception:
-        model_names = ["(could not fetch)"]
+        try:
+            models = _load_models_via_legacy()
+            model_names = [m["id"] for m in models]
+        except Exception:
+            model_names = ["(could not fetch)"]
+        runtime = tm
 
     # Write server.json for port discovery
     _write_server_info(host, port)
@@ -402,10 +628,19 @@ def serve(
     # Banner
     console.print()
     console.print(f"[bold cyan]🚀 CopilotX v{__version__}[/]")
-    console.print(
-        f"[green]✅ Copilot Token valid "
-        f"({tm.expires_in_seconds // 60}m remaining, auto-refresh)[/]"
-    )
+    if use_pool:
+        enabled_accounts = len(_enabled_accounts(repo))
+        strategy = repo.get_rotation_strategy()
+        healthy = pool_health["accounts_healthy"] if pool_health else 0
+        console.print(
+            f"[green]✅ Account pool ready "
+            f"({healthy}/{enabled_accounts} healthy, strategy: {strategy})[/]"
+        )
+    else:
+        console.print(
+            f"[green]✅ Copilot Token valid "
+            f"({tm.expires_in_seconds // 60}m remaining, auto-refresh)[/]"
+        )
 
     if is_remote:
         if has_api_key:
@@ -419,13 +654,15 @@ def serve(
     else:
         console.print("[dim]🏠 Local mode (localhost only)[/]")
 
-    # Show dynamic API base URL
-    api_base = tm.api_base_url
-    if api_base:
-        # Extract hostname for display
-        from urllib.parse import urlparse
-        api_host = urlparse(api_base).hostname or api_base
-        console.print(f"[dim]🎯 API: {api_host} (auto-detected)[/]")
+    if not use_pool:
+        # Show dynamic API base URL
+        api_base = tm.api_base_url
+        if api_base:
+            # Extract hostname for display
+            from urllib.parse import urlparse
+
+            api_host = urlparse(api_base).hostname or api_base
+            console.print(f"[dim]🎯 API: {api_host} (auto-detected)[/]")
 
     console.print(f"[dim]📋 Models: {', '.join(model_names)}[/]")
     console.print(f"[dim]📁 Port info: {SERVER_FILE}[/]")
@@ -443,7 +680,7 @@ def serve(
 
     from copilotx.server.app import create_app
 
-    fastapi_app = create_app(tm)
+    fastapi_app = create_app(runtime)
     try:
         uvicorn.run(fastapi_app, host=host, port=port, log_level="info")
     finally:

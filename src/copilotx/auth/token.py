@@ -114,7 +114,7 @@ class TokenManager:
 # ── helpers ─────────────────────────────────────────────────────────
 
 
-async def _fetch_copilot_token(github_token: str) -> tuple[str, float, str]:
+async def fetch_copilot_token(github_token: str) -> tuple[str, float, str]:
     """Exchange a GitHub OAuth token for a short-lived Copilot JWT.
     Returns (copilot_jwt, expires_at_unix, api_base_url).
     """
@@ -147,3 +147,6 @@ async def _fetch_copilot_token(github_token: str) -> tuple[str, float, str]:
         api_base_url = endpoints.get("api", "")
 
         return token, expires_at, api_base_url
+
+
+_fetch_copilot_token = fetch_copilot_token

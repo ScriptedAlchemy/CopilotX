@@ -76,18 +76,18 @@ ANTHROPIC_TO_COPILOT_MODEL_MAP = {
 
 def map_anthropic_model_to_copilot(model: str) -> str:
     """Map Anthropic model names to Copilot-compatible model names.
-    
+
     Claude Code sends Anthropic-style model names like 'claude-sonnet-4-5-20250929',
     but Copilot API expects names like 'claude-sonnet-4.5'.
     """
     # Direct mapping
     if model in ANTHROPIC_TO_COPILOT_MODEL_MAP:
         return ANTHROPIC_TO_COPILOT_MODEL_MAP[model]
-    
+
     # If already a Copilot-compatible name (has dots like 4.5), return as-is
     if "." in model:
         return model
-    
+
     # Fuzzy matching for unknown variants
     model_lower = model.lower()
     if "sonnet" in model_lower:
@@ -102,7 +102,7 @@ def map_anthropic_model_to_copilot(model: str) -> str:
         return "claude-opus-41"
     if "haiku" in model_lower:
         return "claude-haiku-4.5"
-    
+
     # Fall back to original model name (might be GPT model etc.)
     return model
 
@@ -300,7 +300,10 @@ def _convert_anthropic_tools(tools: list[dict]) -> list[dict]:
     """Convert Anthropic tools definitions to OpenAI tools format.
 
     Anthropic:  {"name": ..., "description": ..., "input_schema": {...}}
-    OpenAI:     {"type": "function", "function": {"name": ..., "description": ..., "parameters": {...}}}
+    OpenAI:     {
+        "type": "function",
+        "function": {"name": ..., "description": ..., "parameters": {...}},
+    }
     """
     openai_tools = []
     for tool in tools:
@@ -309,14 +312,20 @@ def _convert_anthropic_tools(tools: list[dict]) -> list[dict]:
 
         if tool_type in ("computer_20241022", "bash_20241022", "text_editor_20241022"):
             # Anthropic built-in tools — convert to function calls
-            openai_tools.append({
-                "type": "function",
-                "function": {
-                    "name": tool.get("name", tool_type),
-                    "description": tool.get("description", f"Anthropic {tool_type} tool"),
-                    "parameters": tool.get("input_schema", {"type": "object", "properties": {}}),
-                },
-            })
+            openai_tools.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": tool.get("name", tool_type),
+                        "description": tool.get(
+                            "description", f"Anthropic {tool_type} tool"
+                        ),
+                        "parameters": tool.get(
+                            "input_schema", {"type": "object", "properties": {}}
+                        ),
+                    },
+                }
+            )
         else:
             # Standard custom tool
             func_def: dict[str, Any] = {
@@ -370,6 +379,514 @@ def _convert_anthropic_tool_choice(tool_choice: Any) -> Any:
                 "function": {"name": tool_choice["name"]},
             }
     return "auto"
+
+
+def _convert_anthropic_tools_to_responses(tools: list[dict]) -> list[dict]:
+    """Convert Anthropic tools to OpenAI Responses tool format."""
+    response_tools = []
+    for tool in tools:
+        tool_type = tool.get("type", "custom")
+        response_tool = {
+            "type": "function",
+            "name": tool.get("name", tool_type),
+            "description": tool.get(
+                "description",
+                f"Anthropic {tool_type} tool",
+            ),
+            "parameters": tool.get(
+                "input_schema",
+                {"type": "object", "properties": {}},
+            ),
+        }
+        response_tools.append(response_tool)
+    return response_tools
+
+
+def _convert_anthropic_tool_choice_to_responses(tool_choice: Any) -> Any:
+    """Convert Anthropic tool_choice to Responses API tool_choice."""
+    if isinstance(tool_choice, str):
+        if tool_choice == "any":
+            return "required"
+        return tool_choice
+
+    if isinstance(tool_choice, dict):
+        tc_type = tool_choice.get("type", "auto")
+        if tc_type == "auto":
+            return "auto"
+        if tc_type == "any":
+            return "required"
+        if tc_type == "none":
+            return "none"
+        if tc_type == "tool":
+            return {"type": "function", "name": tool_choice["name"]}
+
+    return "auto"
+
+
+def _anthropic_tool_result_to_output_text(content: Any) -> str:
+    """Flatten Anthropic tool_result content into a Responses output string."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        text_parts = []
+        for block in content:
+            if isinstance(block, str):
+                text_parts.append(block)
+            elif isinstance(block, dict) and block.get("type") == "text":
+                text_parts.append(str(block.get("text", "")))
+        return "\n".join(part for part in text_parts if part)
+    if isinstance(content, (dict, list)):
+        return json.dumps(content)
+    return str(content)
+
+
+def anthropic_to_openai_responses_request(body: dict) -> dict[str, Any]:
+    """Convert Anthropic /v1/messages requests to OpenAI Responses format."""
+    input_items: list[dict[str, Any]] = []
+
+    system = body.get("system")
+    if system:
+        if isinstance(system, str):
+            input_items.append(
+                {
+                    "role": "system",
+                    "content": [{"type": "input_text", "text": system}],
+                }
+            )
+        elif isinstance(system, list):
+            text_parts = [b["text"] for b in system if b.get("type") == "text"]
+            if text_parts:
+                input_items.append(
+                    {
+                        "role": "system",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": "\n".join(text_parts),
+                            }
+                        ],
+                    }
+                )
+
+    for msg in body.get("messages", []):
+        role = msg["role"]
+        content = msg.get("content")
+
+        if isinstance(content, str):
+            input_items.append(
+                {
+                    "role": role,
+                    "content": [{"type": "input_text", "text": content}],
+                }
+            )
+            continue
+
+        if not isinstance(content, list):
+            continue
+
+        message_content: list[dict[str, Any]] = []
+        assistant_tool_uses: list[dict[str, Any]] = []
+        user_tool_results: list[dict[str, Any]] = []
+
+        for block in content:
+            if isinstance(block, str):
+                message_content.append({"type": "input_text", "text": block})
+                continue
+
+            block_type = block.get("type")
+            if block_type == "text":
+                message_content.append(
+                    {"type": "input_text", "text": block.get("text", "")}
+                )
+            elif block_type == "image":
+                source = block.get("source", {})
+                if source.get("type") == "base64":
+                    media_type = source.get("media_type", "image/png")
+                    data_b64 = source.get("data", "")
+                    message_content.append(
+                        {
+                            "type": "input_image",
+                            "image_url": f"data:{media_type};base64,{data_b64}",
+                        }
+                    )
+                elif source.get("type") == "url":
+                    message_content.append(
+                        {
+                            "type": "input_image",
+                            "image_url": source.get("url", ""),
+                        }
+                    )
+            elif block_type == "tool_use" and role == "assistant":
+                assistant_tool_uses.append(block)
+            elif block_type == "tool_result" and role == "user":
+                user_tool_results.append(block)
+
+        if message_content:
+            input_items.append({"role": role, "content": message_content})
+
+        for tool_use in assistant_tool_uses:
+            input_items.append(
+                {
+                    "type": "function_call",
+                    "call_id": tool_use.get("id", f"call_{uuid.uuid4().hex[:24]}"),
+                    "name": tool_use.get("name", ""),
+                    "arguments": json.dumps(tool_use.get("input", {})),
+                }
+            )
+
+        for tool_result in user_tool_results:
+            input_items.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": tool_result.get("tool_use_id", ""),
+                    "output": _anthropic_tool_result_to_output_text(
+                        tool_result.get("content", "")
+                    ),
+                }
+            )
+
+    anthropic_model = body.get("model", "gpt-4o")
+    copilot_model = map_anthropic_model_to_copilot(anthropic_model)
+
+    responses_req: dict[str, Any] = {
+        "model": copilot_model,
+        "input": input_items,
+    }
+    if "max_tokens" in body:
+        responses_req["max_output_tokens"] = body["max_tokens"]
+    if "temperature" in body:
+        responses_req["temperature"] = body["temperature"]
+    if "top_p" in body:
+        responses_req["top_p"] = body["top_p"]
+    if "stream" in body:
+        responses_req["stream"] = body["stream"]
+    if "tools" in body:
+        responses_req["tools"] = _convert_anthropic_tools_to_responses(body["tools"])
+    if "tool_choice" in body:
+        responses_req["tool_choice"] = _convert_anthropic_tool_choice_to_responses(
+            body["tool_choice"]
+        )
+
+    return responses_req
+
+
+def _openai_chat_content_to_responses_parts(content: Any) -> list[dict[str, Any]]:
+    """Convert OpenAI chat-completions message content to Responses input parts."""
+    if isinstance(content, str):
+        return [{"type": "input_text", "text": content}]
+    if not isinstance(content, list):
+        return []
+
+    parts: list[dict[str, Any]] = []
+    for item in content:
+        if isinstance(item, str):
+            parts.append({"type": "input_text", "text": item})
+            continue
+        if not isinstance(item, dict):
+            continue
+
+        item_type = item.get("type")
+        if item_type == "text":
+            parts.append({"type": "input_text", "text": str(item.get("text", ""))})
+        elif item_type == "image_url":
+            image_url = item.get("image_url", {})
+            if isinstance(image_url, dict):
+                url = image_url.get("url", "")
+            else:
+                url = str(image_url)
+            if url:
+                parts.append({"type": "input_image", "image_url": url})
+
+    return parts
+
+
+def _openai_chat_tool_result_to_output_text(content: Any) -> str:
+    """Flatten OpenAI tool message content into Responses output text."""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return str(content)
+
+    text_parts: list[str] = []
+    for item in content:
+        if isinstance(item, str):
+            text_parts.append(item)
+            continue
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "text":
+            text_parts.append(str(item.get("text", "")))
+
+    return "\n".join(part for part in text_parts if part)
+
+
+def _openai_chat_tools_to_responses(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Convert chat-completions tool definitions to Responses tool definitions."""
+    responses_tools: list[dict[str, Any]] = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+
+        if tool.get("type") == "custom":
+            responses_tool = {
+                "type": "function",
+                "name": tool.get("name", ""),
+                "parameters": tool.get(
+                    "parameters", {"type": "object", "properties": {}}
+                ),
+            }
+            if "description" in tool:
+                responses_tool["description"] = tool["description"]
+            responses_tools.append(responses_tool)
+            continue
+
+        function = tool.get("function", {}) if tool.get("type") == "function" else {}
+        if not function:
+            continue
+
+        responses_tool = {
+            "type": "function",
+            "name": function.get("name", ""),
+            "parameters": function.get(
+                "parameters", {"type": "object", "properties": {}}
+            ),
+        }
+        if "description" in function:
+            responses_tool["description"] = function["description"]
+        responses_tools.append(responses_tool)
+
+    return responses_tools
+
+
+def _openai_chat_tool_choice_to_responses(tool_choice: Any) -> Any:
+    """Convert chat-completions tool_choice to Responses format."""
+    if isinstance(tool_choice, str):
+        return tool_choice
+    if isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
+        function = tool_choice.get("function", {})
+        return {"type": "function", "name": function.get("name", "")}
+    return tool_choice
+
+
+def _responses_input_part_to_openai_chat_part(part: dict[str, Any]) -> dict[str, Any] | None:
+    """Convert a Responses content part to OpenAI chat-completions content."""
+    part_type = part.get("type")
+    if part_type == "input_text":
+        return {"type": "text", "text": str(part.get("text", ""))}
+
+    if part_type in ("input_image", "image", "image_url"):
+        image_url = part.get("image_url") or part.get("url") or part.get("image")
+        if isinstance(image_url, dict):
+            image_url = image_url.get("url", "")
+        if image_url:
+            return {"type": "image_url", "image_url": {"url": str(image_url)}}
+
+    return None
+
+
+def _responses_input_item_to_openai_chat_content(item: dict[str, Any]) -> Any:
+    """Convert a Responses input item to OpenAI chat-completions content."""
+    content = item.get("content")
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+
+    chat_parts: list[dict[str, Any]] = []
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        converted = _responses_input_part_to_openai_chat_part(part)
+        if converted is not None:
+            chat_parts.append(converted)
+
+    if not chat_parts:
+        return ""
+    if len(chat_parts) == 1 and chat_parts[0].get("type") == "text":
+        return chat_parts[0]["text"]
+    return chat_parts
+
+
+def _responses_tools_to_openai_chat_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Convert Responses tool definitions to chat-completions tool definitions."""
+    chat_tools: list[dict[str, Any]] = []
+    for tool in tools:
+        if not isinstance(tool, dict) or tool.get("type") != "function":
+            continue
+
+        function: dict[str, Any] = {
+            "name": tool.get("name", ""),
+            "parameters": tool.get(
+                "parameters",
+                {"type": "object", "properties": {}},
+            ),
+        }
+        if "description" in tool:
+            function["description"] = tool["description"]
+
+        chat_tools.append({"type": "function", "function": function})
+
+    return chat_tools
+
+
+def _responses_tool_choice_to_openai_chat(tool_choice: Any) -> Any:
+    """Convert Responses tool_choice to chat-completions format."""
+    if isinstance(tool_choice, str):
+        return tool_choice
+    if isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
+        return {
+            "type": "function",
+            "function": {"name": tool_choice.get("name", "")},
+        }
+    return tool_choice
+
+
+def openai_responses_to_chat_request(body: dict[str, Any]) -> dict[str, Any]:
+    """Convert an OpenAI Responses request to chat-completions format."""
+    messages: list[dict[str, Any]] = []
+    pending_tool_calls: list[dict[str, Any]] = []
+
+    def flush_tool_calls() -> None:
+        if not pending_tool_calls:
+            return
+        messages.append(
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": pending_tool_calls.copy(),
+            }
+        )
+        pending_tool_calls.clear()
+
+    for item in body.get("input", []):
+        if not isinstance(item, dict):
+            continue
+
+        item_type = item.get("type")
+        if item_type == "function_call":
+            pending_tool_calls.append(
+                {
+                    "id": item.get("call_id")
+                    or item.get("id")
+                    or f"call_{uuid.uuid4().hex[:24]}",
+                    "type": "function",
+                    "function": {
+                        "name": item.get("name", ""),
+                        "arguments": item.get("arguments", "{}"),
+                    },
+                }
+            )
+            continue
+
+        if item_type == "function_call_output":
+            flush_tool_calls()
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": item.get("call_id", ""),
+                    "content": str(item.get("output", "")),
+                }
+            )
+            continue
+
+        flush_tool_calls()
+        role = item.get("role")
+        if not role:
+            continue
+        messages.append(
+            {
+                "role": role,
+                "content": _responses_input_item_to_openai_chat_content(item),
+            }
+        )
+
+    flush_tool_calls()
+
+    chat_req: dict[str, Any] = {
+        "model": body.get("model", "gpt-4o"),
+        "messages": messages or [{"role": "user", "content": ""}],
+    }
+    if "temperature" in body:
+        chat_req["temperature"] = body["temperature"]
+    if "top_p" in body:
+        chat_req["top_p"] = body["top_p"]
+    if "max_output_tokens" in body:
+        chat_req["max_completion_tokens"] = body["max_output_tokens"]
+    if "tools" in body:
+        chat_req["tools"] = _responses_tools_to_openai_chat_tools(body["tools"])
+    if "tool_choice" in body:
+        chat_req["tool_choice"] = _responses_tool_choice_to_openai_chat(
+            body["tool_choice"]
+        )
+    if "parallel_tool_calls" in body:
+        chat_req["parallel_tool_calls"] = body["parallel_tool_calls"]
+
+    return chat_req
+
+
+def openai_chat_to_responses_request(body: dict[str, Any]) -> dict[str, Any]:
+    """Convert OpenAI chat-completions requests to Responses requests."""
+    input_items: list[dict[str, Any]] = []
+
+    for msg in body.get("messages", []):
+        if not isinstance(msg, dict):
+            continue
+
+        role = msg.get("role", "user")
+        content = msg.get("content")
+
+        if role == "tool":
+            input_items.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": msg.get("tool_call_id", ""),
+                    "output": _openai_chat_tool_result_to_output_text(content),
+                }
+            )
+            continue
+
+        message_content = _openai_chat_content_to_responses_parts(content)
+        if message_content:
+            input_items.append({"role": role, "content": message_content})
+
+        if role != "assistant":
+            continue
+
+        for tool_call in msg.get("tool_calls", []):
+            if not isinstance(tool_call, dict):
+                continue
+            function = tool_call.get("function", {})
+            input_items.append(
+                {
+                    "type": "function_call",
+                    "call_id": tool_call.get("id", f"call_{uuid.uuid4().hex[:24]}"),
+                    "name": function.get("name", ""),
+                    "arguments": function.get("arguments", "{}"),
+                }
+            )
+
+    responses_req: dict[str, Any] = {
+        "model": body.get("model", "gpt-4o"),
+        "input": input_items,
+    }
+    if "temperature" in body:
+        responses_req["temperature"] = body["temperature"]
+    if "top_p" in body:
+        responses_req["top_p"] = body["top_p"]
+    if "stream" in body:
+        responses_req["stream"] = body["stream"]
+    if "max_completion_tokens" in body:
+        responses_req["max_output_tokens"] = body["max_completion_tokens"]
+    elif "max_tokens" in body:
+        responses_req["max_output_tokens"] = body["max_tokens"]
+    if "tools" in body:
+        responses_req["tools"] = _openai_chat_tools_to_responses(body["tools"])
+    if "tool_choice" in body:
+        responses_req["tool_choice"] = _openai_chat_tool_choice_to_responses(
+            body["tool_choice"]
+        )
+
+    return responses_req
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -478,6 +995,592 @@ def openai_to_anthropic_response(openai_resp: dict, model: str) -> dict:
     }
 
 
+def openai_responses_to_anthropic_response(
+    response: dict[str, Any],
+    model: str,
+) -> dict[str, Any]:
+    """Convert an OpenAI Responses API response to Anthropic format."""
+    content_blocks: list[dict[str, Any]] = []
+    stop_reason = "end_turn"
+
+    for item in response.get("output", []):
+        item_type = item.get("type")
+        if item_type == "message":
+            text_parts = []
+            for part in item.get("content", []):
+                if part.get("type") == "output_text":
+                    text_parts.append(str(part.get("text", "")))
+            if text_parts:
+                content_blocks.append({"type": "text", "text": "".join(text_parts)})
+        elif item_type == "function_call":
+            try:
+                tool_input = json.loads(item.get("arguments", "{}"))
+            except (json.JSONDecodeError, TypeError):
+                tool_input = {}
+            content_blocks.append(
+                {
+                    "type": "tool_use",
+                    "id": item.get("call_id") or item.get("id") or f"toolu_{uuid.uuid4().hex[:24]}",
+                    "name": item.get("name", ""),
+                    "input": tool_input,
+                }
+            )
+            stop_reason = "tool_use"
+
+    if not content_blocks:
+        content_blocks.append({"type": "text", "text": ""})
+
+    incomplete = response.get("incomplete_details") or {}
+    if stop_reason != "tool_use" and incomplete.get("reason") == "max_output_tokens":
+        stop_reason = "max_tokens"
+
+    usage = response.get("usage", {})
+    return {
+        "id": f"msg_{uuid.uuid4().hex[:24]}",
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": content_blocks,
+        "stop_reason": stop_reason,
+        "stop_sequence": None,
+        "usage": {
+            "input_tokens": usage.get("input_tokens", 0),
+            "output_tokens": usage.get("output_tokens", 0),
+        },
+    }
+
+
+def openai_responses_to_chat_response(response: dict[str, Any]) -> dict[str, Any]:
+    """Convert an OpenAI Responses API response to chat-completions format."""
+    message_text_parts: list[str] = []
+    tool_calls: list[dict[str, Any]] = []
+
+    for item in response.get("output", []):
+        item_type = item.get("type")
+        if item_type == "message":
+            for part in item.get("content", []):
+                if part.get("type") == "output_text":
+                    message_text_parts.append(str(part.get("text", "")))
+        elif item_type == "function_call":
+            tool_calls.append(
+                {
+                    "id": item.get("call_id")
+                    or item.get("id")
+                    or f"call_{uuid.uuid4().hex[:24]}",
+                    "type": "function",
+                    "function": {
+                        "name": item.get("name", ""),
+                        "arguments": item.get("arguments", "{}"),
+                    },
+                }
+            )
+
+    finish_reason = "stop"
+    incomplete = response.get("incomplete_details") or {}
+    if tool_calls:
+        finish_reason = "tool_calls"
+    elif incomplete.get("reason") == "max_output_tokens":
+        finish_reason = "length"
+
+    content = "".join(message_text_parts)
+    message: dict[str, Any] = {
+        "role": "assistant",
+        "content": content if content else None,
+    }
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+
+    usage = response.get("usage", {})
+    input_tokens = usage.get("input_tokens", 0)
+    output_tokens = usage.get("output_tokens", 0)
+    return {
+        "id": response.get("id", f"chatcmpl-{uuid.uuid4().hex[:24]}"),
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": response.get("model", ""),
+        "choices": [
+            {
+                "index": 0,
+                "message": message,
+                "finish_reason": finish_reason,
+            }
+        ],
+        "usage": {
+            "prompt_tokens": input_tokens,
+            "completion_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens,
+        },
+    }
+
+
+def _openai_chat_sse_event(payload: dict[str, Any]) -> bytes:
+    return f"data: {json.dumps(payload, separators=(',', ':'))}\n\n".encode("utf-8")
+
+
+def _responses_sse_event(event: str, payload: dict[str, Any]) -> bytes:
+    return (
+        f"event: {event}\n"
+        f"data: {json.dumps(payload, separators=(',', ':'))}\n\n"
+    ).encode("utf-8")
+
+
+def _openai_chat_message_text(content: Any) -> str:
+    """Flatten a chat-completions assistant message content into plain text."""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+
+    text_parts: list[str] = []
+    for part in content:
+        if isinstance(part, str):
+            text_parts.append(part)
+            continue
+        if not isinstance(part, dict):
+            continue
+        if part.get("type") == "text":
+            text_parts.append(str(part.get("text", "")))
+
+    return "".join(text_parts)
+
+
+def openai_chat_to_responses_response(
+    response: dict[str, Any],
+    request: dict[str, Any],
+) -> dict[str, Any]:
+    """Convert a chat-completions response to OpenAI Responses format."""
+    text_parts: list[str] = []
+    tool_calls: list[dict[str, Any]] = []
+    finish_reason = "stop"
+
+    for choice in response.get("choices", []):
+        if not isinstance(choice, dict):
+            continue
+        message = choice.get("message", {})
+        if isinstance(message, dict):
+            content = _openai_chat_message_text(message.get("content"))
+            if content:
+                text_parts.append(content)
+            for tool_call in message.get("tool_calls", []):
+                if isinstance(tool_call, dict):
+                    tool_calls.append(tool_call)
+
+        choice_finish = str(choice.get("finish_reason") or "")
+        if choice_finish == "tool_calls":
+            finish_reason = choice_finish
+        elif choice_finish and finish_reason != "tool_calls":
+            finish_reason = choice_finish
+
+    output: list[dict[str, Any]] = []
+    joined_text = "".join(text_parts)
+    if joined_text or not tool_calls:
+        output.append(
+            {
+                "id": f"msg_{uuid.uuid4().hex[:24]}",
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": joined_text,
+                        "annotations": [],
+                        "logprobs": [],
+                    }
+                ],
+            }
+        )
+
+    for tool_call in tool_calls:
+        function = tool_call.get("function", {})
+        call_id = tool_call.get("id") or f"call_{uuid.uuid4().hex[:24]}"
+        output.append(
+            {
+                "id": call_id,
+                "type": "function_call",
+                "call_id": call_id,
+                "name": function.get("name", ""),
+                "arguments": function.get("arguments", "{}"),
+            }
+        )
+
+    usage = response.get("usage", {})
+    input_tokens = int(usage.get("prompt_tokens", 0) or 0)
+    output_tokens = int(usage.get("completion_tokens", 0) or 0)
+    text_cfg = request.get("text") if isinstance(request.get("text"), dict) else {}
+
+    result: dict[str, Any] = {
+        "id": response.get("id", f"resp_{uuid.uuid4().hex[:24]}"),
+        "object": "response",
+        "created_at": int(response.get("created", time.time())),
+        "model": response.get("model", request.get("model", "")),
+        "output": output,
+        "parallel_tool_calls": request.get("parallel_tool_calls", bool(tool_calls)),
+        "previous_response_id": request.get("previous_response_id"),
+        "status": "completed",
+        "store": bool(request.get("store", False)),
+        "text": {
+            "format": {"type": "text"},
+            "verbosity": text_cfg.get("verbosity", "medium"),
+        },
+        "tool_choice": request.get("tool_choice", "auto"),
+        "tools": request.get("tools", []),
+        "usage": {
+            "input_tokens": input_tokens,
+            "input_tokens_details": {"cached_tokens": 0},
+            "output_tokens": output_tokens,
+            "output_tokens_details": {"reasoning_tokens": 0},
+            "total_tokens": input_tokens + output_tokens,
+        },
+    }
+    if finish_reason == "length":
+        result["incomplete_details"] = {"reason": "max_output_tokens"}
+    else:
+        result["incomplete_details"] = None
+    if "prompt_cache_retention" in request:
+        result["prompt_cache_retention"] = request["prompt_cache_retention"]
+    if "safety_identifier" in request:
+        result["safety_identifier"] = request["safety_identifier"]
+
+    return result
+
+
+async def openai_chat_to_responses_stream(
+    response: dict[str, Any],
+    request: dict[str, Any],
+) -> AsyncIterator[bytes]:
+    """Emit a Responses SSE stream from a completed chat-completions response."""
+    completed = openai_chat_to_responses_response(response, request)
+    in_progress = dict(completed)
+    in_progress["status"] = "in_progress"
+    in_progress["output"] = []
+
+    sequence_number = 0
+    yield _responses_sse_event(
+        "response.created",
+        {
+            "type": "response.created",
+            "sequence_number": sequence_number,
+            "response": in_progress,
+        },
+    )
+    sequence_number += 1
+    yield _responses_sse_event(
+        "response.in_progress",
+        {
+            "type": "response.in_progress",
+            "sequence_number": sequence_number,
+            "response": in_progress,
+        },
+    )
+    sequence_number += 1
+
+    for output_index, item in enumerate(completed.get("output", [])):
+        if item.get("type") == "message":
+            message_item = {
+                "id": item["id"],
+                "type": "message",
+                "role": "assistant",
+                "status": "in_progress",
+                "phase": "final_answer",
+                "content": [],
+            }
+            yield _responses_sse_event(
+                "response.output_item.added",
+                {
+                    "type": "response.output_item.added",
+                    "sequence_number": sequence_number,
+                    "output_index": output_index,
+                    "item": message_item,
+                },
+            )
+            sequence_number += 1
+
+            part = {
+                "type": "output_text",
+                "text": "",
+                "annotations": [],
+                "logprobs": [],
+            }
+            yield _responses_sse_event(
+                "response.content_part.added",
+                {
+                    "type": "response.content_part.added",
+                    "sequence_number": sequence_number,
+                    "output_index": output_index,
+                    "item_id": item["id"],
+                    "content_index": 0,
+                    "part": part,
+                },
+            )
+            sequence_number += 1
+
+            text = ""
+            content = item.get("content", [])
+            if content:
+                text = str(content[0].get("text", ""))
+            if text:
+                yield _responses_sse_event(
+                    "response.output_text.delta",
+                    {
+                        "type": "response.output_text.delta",
+                        "sequence_number": sequence_number,
+                        "output_index": output_index,
+                        "item_id": item["id"],
+                        "content_index": 0,
+                        "delta": text,
+                    },
+                )
+                sequence_number += 1
+                yield _responses_sse_event(
+                    "response.output_text.done",
+                    {
+                        "type": "response.output_text.done",
+                        "sequence_number": sequence_number,
+                        "output_index": output_index,
+                        "item_id": item["id"],
+                        "content_index": 0,
+                        "text": text,
+                    },
+                )
+                sequence_number += 1
+
+            completed_part = dict(part)
+            completed_part["text"] = text
+            yield _responses_sse_event(
+                "response.content_part.done",
+                {
+                    "type": "response.content_part.done",
+                    "sequence_number": sequence_number,
+                    "output_index": output_index,
+                    "item_id": item["id"],
+                    "content_index": 0,
+                    "part": completed_part,
+                },
+            )
+            sequence_number += 1
+            yield _responses_sse_event(
+                "response.output_item.done",
+                {
+                    "type": "response.output_item.done",
+                    "sequence_number": sequence_number,
+                    "output_index": output_index,
+                    "item": item,
+                },
+            )
+            sequence_number += 1
+            continue
+
+        yield _responses_sse_event(
+            "response.output_item.added",
+            {
+                "type": "response.output_item.added",
+                "sequence_number": sequence_number,
+                "output_index": output_index,
+                "item": item,
+            },
+        )
+        sequence_number += 1
+        yield _responses_sse_event(
+            "response.output_item.done",
+            {
+                "type": "response.output_item.done",
+                "sequence_number": sequence_number,
+                "output_index": output_index,
+                "item": item,
+            },
+        )
+        sequence_number += 1
+
+    yield _responses_sse_event(
+        "response.completed",
+        {
+            "type": "response.completed",
+            "sequence_number": sequence_number,
+            "response": completed,
+        },
+    )
+
+
+async def openai_responses_to_chat_stream(
+    response: dict[str, Any],
+) -> AsyncIterator[bytes]:
+    """Emit a chat-completions SSE stream from a completed Responses response."""
+    chat_response = openai_responses_to_chat_response(response)
+    chunk_base = {
+        "id": chat_response["id"],
+        "object": "chat.completion.chunk",
+        "created": chat_response["created"],
+        "model": chat_response["model"],
+    }
+
+    yield _openai_chat_sse_event(
+        {
+            **chunk_base,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"role": "assistant"},
+                    "finish_reason": None,
+                }
+            ],
+        }
+    )
+
+    message = chat_response["choices"][0]["message"]
+    content = message.get("content")
+    if content:
+        yield _openai_chat_sse_event(
+            {
+                **chunk_base,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": content},
+                        "finish_reason": None,
+                    }
+                ],
+            }
+        )
+
+    for index, tool_call in enumerate(message.get("tool_calls", [])):
+        yield _openai_chat_sse_event(
+            {
+                **chunk_base,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": index,
+                                    "id": tool_call["id"],
+                                    "type": "function",
+                                    "function": tool_call["function"],
+                                }
+                            ]
+                        },
+                        "finish_reason": None,
+                    }
+                ],
+            }
+        )
+
+    yield _openai_chat_sse_event(
+        {
+            **chunk_base,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": chat_response["choices"][0]["finish_reason"],
+                }
+            ],
+        }
+    )
+    yield b"data: [DONE]\n\n"
+
+
+async def openai_responses_to_anthropic_stream(
+    response: dict[str, Any],
+    model: str,
+) -> AsyncIterator[bytes]:
+    """Emit an Anthropic SSE stream from a completed Responses API response."""
+    anthropic_response = openai_responses_to_anthropic_response(response, model)
+    yield _sse_event(
+        "message_start",
+        {
+            "type": "message_start",
+            "message": {
+                "id": anthropic_response["id"],
+                "type": "message",
+                "role": "assistant",
+                "model": anthropic_response["model"],
+                "content": [],
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {
+                    "input_tokens": anthropic_response["usage"]["input_tokens"],
+                    "output_tokens": 0,
+                },
+            },
+        },
+    )
+
+    for index, block in enumerate(anthropic_response["content"]):
+        if block["type"] == "text":
+            yield _sse_event(
+                "content_block_start",
+                {
+                    "type": "content_block_start",
+                    "index": index,
+                    "content_block": {"type": "text", "text": ""},
+                },
+            )
+            if block.get("text"):
+                yield _sse_event(
+                    "content_block_delta",
+                    {
+                        "type": "content_block_delta",
+                        "index": index,
+                        "delta": {
+                            "type": "text_delta",
+                            "text": block["text"],
+                        },
+                    },
+                )
+            yield _sse_event(
+                "content_block_stop",
+                {"type": "content_block_stop", "index": index},
+            )
+            continue
+
+        yield _sse_event(
+            "content_block_start",
+            {
+                "type": "content_block_start",
+                "index": index,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": block["id"],
+                    "name": block["name"],
+                    "input": {},
+                },
+            },
+        )
+        if block.get("input"):
+            yield _sse_event(
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": index,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": json.dumps(block["input"]),
+                    },
+                },
+            )
+        yield _sse_event(
+            "content_block_stop",
+            {"type": "content_block_stop", "index": index},
+        )
+
+    yield _sse_event(
+        "message_delta",
+        {
+            "type": "message_delta",
+            "delta": {
+                "stop_reason": anthropic_response["stop_reason"],
+                "stop_sequence": None,
+            },
+            "usage": {
+                "output_tokens": anthropic_response["usage"]["output_tokens"],
+            },
+        },
+    )
+    yield _sse_event("message_stop", {"type": "message_stop"})
+
+
 # ═══════════════════════════════════════════════════════════════════
 #  STREAMING: OpenAI SSE → Anthropic SSE
 # ═══════════════════════════════════════════════════════════════════
@@ -513,8 +1616,6 @@ async def openai_stream_to_anthropic_stream(
     next_block_index = 0
     # Track the text block index
     text_block_index = 0
-    # Whether we've seen any text content
-    has_text = False
     # Accumulated finish_reason
     finish_reason = "end_turn"
 
@@ -586,7 +1687,6 @@ async def openai_stream_to_anthropic_stream(
 
         # ── Handle text content ────────────────────────────────
         if content:
-            has_text = True
             if not sent_text_block_start:
                 text_block_index = next_block_index
                 next_block_index += 1

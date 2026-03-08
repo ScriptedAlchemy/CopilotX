@@ -8,6 +8,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from copilotx import __version__
+from copilotx.auth.pool import TokenPool
 from copilotx.server.app import get_ready_client
 
 router = APIRouter(tags=["Models"])
@@ -16,10 +17,13 @@ router = APIRouter(tags=["Models"])
 @router.get("/v1/models")
 async def list_models(request: Request):
     """List available models (OpenAI format)."""
-    client = await get_ready_client(request.app.state)
-
     try:
-        models = await client.list_models()
+        runtime = request.app.state.runtime
+        if isinstance(runtime, TokenPool):
+            models = await runtime.list_models()
+        else:
+            client = await get_ready_client(request.app.state)
+            models = await client.list_models()
         return JSONResponse(
             content={
                 "object": "list",
@@ -44,6 +48,17 @@ async def list_models(request: Request):
 @router.get("/health")
 async def health(request: Request):
     """Health check endpoint."""
+    runtime = request.app.state.runtime
+    if isinstance(runtime, TokenPool):
+        summary = await runtime.health_snapshot()
+        return JSONResponse(
+            content={
+                "status": "ok",
+                "version": __version__,
+                **summary,
+            }
+        )
+
     tm = request.app.state.token_manager
     return JSONResponse(
         content={

@@ -26,3 +26,6 @@ Thumbs.db
 *.log
 # Tests (contains API keys and sensitive config)
 tests/
+!tests/
+tests/*
+!tests/test_multi_account.py

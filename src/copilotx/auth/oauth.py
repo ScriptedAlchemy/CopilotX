@@ -29,6 +29,14 @@ class DeviceCodeResponse:
     interval: int
 
 
+@dataclass
+class GitHubUser:
+    """Authenticated GitHub user identity."""
+
+    user_id: str
+    login: str
+
+
 class OAuthError(Exception):
     """Raised when the OAuth flow fails."""
 
@@ -120,3 +128,21 @@ async def device_flow_login() -> str:
 
         console.print("[bold green]✅ GitHub authorization successful![/]")
         return token
+
+
+async def fetch_github_user(github_token: str) -> GitHubUser:
+    """Fetch the GitHub identity bound to an access token."""
+    headers = {
+        "Authorization": f"token {github_token}",
+        "Accept": "application/json",
+    }
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get("https://api.github.com/user", headers=headers)
+        if resp.status_code == 401:
+            raise OAuthError("GitHub token is invalid or expired.")
+        resp.raise_for_status()
+        data = resp.json()
+        return GitHubUser(
+            user_id=str(data.get("id", "")),
+            login=str(data.get("login", "")),
+        )

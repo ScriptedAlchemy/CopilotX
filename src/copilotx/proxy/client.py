@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import time
 from typing import Any, AsyncIterator
@@ -120,8 +119,9 @@ class CopilotClient:
                     "Chat completions stream error: status=%d body=%s",
                     resp.status_code, error_body[:1000],
                 )
+                error_text = error_body.decode("utf-8", errors="replace")[:500]
                 raise httpx.HTTPStatusError(
-                    f"HTTP {resp.status_code}: {error_body.decode('utf-8', errors='replace')[:500]}",
+                    f"HTTP {resp.status_code}: {error_text}",
                     request=resp.request,
                     response=resp,
                 )
@@ -192,8 +192,9 @@ class CopilotClient:
                     "Responses stream error: status=%d url=%s body=%s",
                     resp.status_code, url, error_body[:1000],
                 )
+                error_text = error_body.decode("utf-8", errors="replace")[:500]
                 raise httpx.HTTPStatusError(
-                    f"HTTP {resp.status_code}: {error_body.decode('utf-8', errors='replace')[:500]}",
+                    f"HTTP {resp.status_code}: {error_text}",
                     request=resp.request,
                     response=resp,
                 )
