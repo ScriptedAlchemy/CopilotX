@@ -23,7 +23,16 @@ from copilotx.proxy.translator import (
     openai_stream_to_anthropic_stream,
     openai_to_anthropic_response,
 )
-from copilotx.server.app import run_with_runtime, stream_with_runtime
+from copilotx.server.app import probe_with_runtime, run_with_runtime, stream_with_runtime
+from copilotx.server.request_features import (
+    responses_request_has_vision_input,
+    responses_request_initiator,
+)
+from copilotx.server.runtime import CHAT_COMPLETIONS_API, RESPONSES_API
+from copilotx.server.upstream_compat import (
+    is_chat_completions_unsupported_for_model,
+    is_responses_unsupported_for_model,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -37,27 +46,6 @@ async def _prepend_first_chunk(
     yield first_chunk
     async for chunk in stream:
         yield chunk
-
-
-def _should_fallback_to_responses(exc: Exception) -> bool:
-    response = getattr(exc, "response", None)
-    if response is None:
-        return False
-    if response.status_code != 400:
-        return False
-
-    try:
-        payload = json.loads(response.text)
-    except (json.JSONDecodeError, ValueError):
-        payload = {}
-
-    error = payload.get("error", {}) if isinstance(payload, dict) else {}
-    code = str(error.get("code", ""))
-    message = str(error.get("message", response.text)).lower()
-    return (
-        code == "unsupported_api_for_model"
-        or "not accessible via the /chat/completions endpoint" in message
-    )
 
 
 @router.post("/v1/messages")
@@ -85,9 +73,39 @@ async def messages(request: Request):
     openai_payload = anthropic_to_openai_request(body)
     responses_payload = anthropic_to_openai_responses_request(body)
     model = openai_payload.get("model")
+    vision = responses_request_has_vision_input(responses_payload)
+    initiator = responses_request_initiator(responses_payload)
+    runtime = request.app.state.runtime
+    preferred_api = runtime.preferred_api_surface(model, CHAT_COMPLETIONS_API)
 
     try:
         if is_stream:
+            if preferred_api == RESPONSES_API:
+                try:
+                    responses_payload.pop("stream", None)
+                    responses_resp = await probe_with_runtime(
+                        request.app.state,
+                        model=model,
+                        operation=lambda client: client.responses(
+                            deepcopy(responses_payload),
+                            vision=vision,
+                            initiator=initiator,
+                        ),
+                    )
+                    runtime.mark_api_success(model, RESPONSES_API)
+                    anthropic_stream = openai_responses_to_anthropic_stream(
+                        responses_resp,
+                        model,
+                    )
+                    first_chunk = await anext(anthropic_stream)
+                    return sse_response(
+                        _prepend_first_chunk(first_chunk, anthropic_stream)
+                    )
+                except Exception as responses_error:
+                    if not is_responses_unsupported_for_model(responses_error):
+                        raise
+                    runtime.mark_api_unsupported(model, RESPONSES_API)
+
             try:
                 # Stream: OpenAI SSE → Anthropic SSE
                 openai_stream = stream_with_runtime(
@@ -102,12 +120,14 @@ async def messages(request: Request):
                     model,
                 )
                 first_chunk = await anext(anthropic_stream)
+                runtime.mark_api_success(model, CHAT_COMPLETIONS_API)
                 return sse_response(
                     _prepend_first_chunk(first_chunk, anthropic_stream)
                 )
             except Exception as stream_error:
-                if not _should_fallback_to_responses(stream_error):
+                if not is_chat_completions_unsupported_for_model(stream_error):
                     raise
+                runtime.mark_api_unsupported(model, CHAT_COMPLETIONS_API)
 
                 responses_payload.pop("stream", None)
                 responses_resp = await run_with_runtime(
@@ -115,10 +135,11 @@ async def messages(request: Request):
                     model=model,
                     operation=lambda client: client.responses(
                         deepcopy(responses_payload),
-                        vision=False,
-                        initiator="user",
+                        vision=vision,
+                        initiator=initiator,
                     ),
                 )
+                runtime.mark_api_success(model, RESPONSES_API)
                 anthropic_stream = openai_responses_to_anthropic_stream(
                     responses_resp,
                     model,
@@ -128,6 +149,28 @@ async def messages(request: Request):
                     _prepend_first_chunk(first_chunk, anthropic_stream)
                 )
 
+        if preferred_api == RESPONSES_API:
+            try:
+                responses_resp = await probe_with_runtime(
+                    request.app.state,
+                    model=model,
+                    operation=lambda client: client.responses(
+                        deepcopy(responses_payload),
+                        vision=vision,
+                        initiator=initiator,
+                    ),
+                )
+                runtime.mark_api_success(model, RESPONSES_API)
+                anthropic_resp = openai_responses_to_anthropic_response(
+                    responses_resp,
+                    model,
+                )
+                return JSONResponse(content=anthropic_resp)
+            except Exception as responses_error:
+                if not is_responses_unsupported_for_model(responses_error):
+                    raise
+                runtime.mark_api_unsupported(model, RESPONSES_API)
+
         try:
             openai_resp = await run_with_runtime(
                 request.app.state,
@@ -136,20 +179,23 @@ async def messages(request: Request):
                     deepcopy(openai_payload)
                 ),
             )
+            runtime.mark_api_success(model, CHAT_COMPLETIONS_API)
             anthropic_resp = openai_to_anthropic_response(openai_resp, model)
         except Exception as non_stream_error:
-            if not _should_fallback_to_responses(non_stream_error):
+            if not is_chat_completions_unsupported_for_model(non_stream_error):
                 raise
+            runtime.mark_api_unsupported(model, CHAT_COMPLETIONS_API)
 
             responses_resp = await run_with_runtime(
                 request.app.state,
                 model=model,
                 operation=lambda client: client.responses(
                     deepcopy(responses_payload),
-                    vision=False,
-                    initiator="user",
+                    vision=vision,
+                    initiator=initiator,
                 ),
             )
+            runtime.mark_api_success(model, RESPONSES_API)
             anthropic_resp = openai_responses_to_anthropic_response(
                 responses_resp,
                 model,

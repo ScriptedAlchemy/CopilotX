@@ -11,9 +11,9 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from copilotx import __version__, config
-from copilotx.auth.pool import TokenPool
 from copilotx.auth.token import TokenManager
 from copilotx.proxy.client import CopilotClient
+from copilotx.server.runtime import AppRuntime, coerce_runtime
 
 # ── CORS Configuration ──────────────────────────────────────────────
 
@@ -96,32 +96,20 @@ class ApiKeyMiddleware(BaseHTTPMiddleware):
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Manage the CopilotClient lifecycle."""
-    runtime = app.state.runtime
-    if isinstance(runtime, TokenPool):
-        await runtime.__aenter__()
-        try:
-            yield
-        finally:
-            await runtime.__aexit__(None, None, None)
-        return
-
-    tm: TokenManager = app.state.token_manager
-    token = await tm.ensure_copilot_token()
-    client = CopilotClient(token, api_base_url=tm.api_base_url)
-    await client.__aenter__()
-    app.state.client = client
-    app.state.token_manager = tm
+    runtime: AppRuntime = app.state.runtime
+    await runtime.startup()
     try:
         yield
     finally:
-        await client.__aexit__(None, None, None)
+        await runtime.shutdown()
 
 
 # ── App Factory ─────────────────────────────────────────────────────
 
 
-def create_app(runtime: TokenManager | TokenPool) -> FastAPI:
+def create_app(runtime: TokenManager | AppRuntime | Any) -> FastAPI:
     """Create and configure the FastAPI application."""
+    runtime = coerce_runtime(runtime)
 
     app = FastAPI(
         title="CopilotX",
@@ -130,10 +118,6 @@ def create_app(runtime: TokenManager | TokenPool) -> FastAPI:
         lifespan=lifespan,
     )
     app.state.runtime = runtime
-    if isinstance(runtime, TokenPool):
-        app.state.token_manager = None
-    else:
-        app.state.token_manager = runtime
 
     # Add CORS middleware (must be before other middlewares)
     app.add_middleware(
@@ -161,17 +145,6 @@ def create_app(runtime: TokenManager | TokenPool) -> FastAPI:
     return app
 
 
-async def get_ready_client(app_state) -> CopilotClient:
-    """Get a CopilotClient with a valid token, refreshing if needed."""
-    tm: TokenManager = app_state.token_manager
-    client: CopilotClient = app_state.client
-    # Ensure token is fresh
-    token = await tm.ensure_copilot_token()
-    client.update_token(token)
-    client.update_api_base(tm.api_base_url)
-    return client
-
-
 async def run_with_runtime(
     app_state,
     *,
@@ -179,12 +152,19 @@ async def run_with_runtime(
     operation: Callable[[CopilotClient], Awaitable[Any]],
 ) -> Any:
     """Execute a non-streaming request against either the pool or legacy client."""
-    runtime = app_state.runtime
-    if isinstance(runtime, TokenPool):
-        return await runtime.execute(model=model, operation=operation)
+    runtime: AppRuntime = app_state.runtime
+    return await runtime.execute(model=model, operation=operation)
 
-    client = await get_ready_client(app_state)
-    return await operation(client)
+
+async def probe_with_runtime(
+    app_state,
+    *,
+    model: str | None,
+    operation: Callable[[CopilotClient], Awaitable[Any]],
+) -> Any:
+    """Run a best-effort runtime probe without mutating runtime health on failure."""
+    runtime: AppRuntime = app_state.runtime
+    return await runtime.probe(model=model, operation=operation)
 
 
 async def stream_with_runtime(
@@ -194,12 +174,6 @@ async def stream_with_runtime(
     operation: Callable[[CopilotClient], AsyncIterator[bytes]],
 ) -> AsyncIterator[bytes]:
     """Stream a request against either the pool or legacy client."""
-    runtime = app_state.runtime
-    if isinstance(runtime, TokenPool):
-        async for chunk in runtime.stream(model=model, operation=operation):
-            yield chunk
-        return
-
-    client = await get_ready_client(app_state)
-    async for chunk in operation(client):
+    runtime: AppRuntime = app_state.runtime
+    async for chunk in runtime.stream(model=model, operation=operation):
         yield chunk

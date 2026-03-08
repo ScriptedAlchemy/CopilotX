@@ -335,6 +335,26 @@ class TokenPool:
 
         raise last_error or PoolError("No upstream account could satisfy the request.")
 
+    async def probe(
+        self,
+        *,
+        model: str | None,
+        operation: Callable[[CopilotClient], Awaitable[Any]],
+    ) -> Any:
+        """Run a best-effort operation without mutating pool health on failure."""
+        await self.sync_accounts()
+        lease = await self.acquire(
+            model=model,
+            is_stream=False,
+            exclude_account_ids=set(),
+        )
+        try:
+            result = await operation(lease.client)
+            await self._mark_success(lease.entry)
+            return result
+        finally:
+            await lease.release()
+
     async def stream(
         self,
         *,

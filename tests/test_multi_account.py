@@ -13,6 +13,16 @@ from copilotx.auth.accounts import AccountRecord, AccountRepository
 from copilotx.auth.pool import TokenPool
 from copilotx.proxy.translator import openai_responses_to_chat_request
 from copilotx.server.app import create_app
+from copilotx.server.runtime import ModelRoutingRegistry
+
+RESPONSES_ONLY_ERROR = (
+    '{"error":{"message":"model \\"%s\\" is not accessible via '
+    'the /chat/completions endpoint","code":"unsupported_api_for_model"}}'
+)
+CHAT_ONLY_ERROR = (
+    '{"error":{"message":"model \\"%s\\" '
+    'does not support Responses API.","code":"unsupported_api_for_model"}}'
+)
 
 
 def make_account(
@@ -287,7 +297,7 @@ def test_openai_route_uses_token_pool_runtime(tmp_path: Path) -> None:
     state = {
         "token-1": {
             "name": "alpha",
-            "models": ["gpt-5.4", "gemini-3.1-pro"],
+            "models": ["gemini-3.1-pro"],
             "errors": [],
             "chat_calls": 0,
         }
@@ -311,7 +321,7 @@ def test_openai_route_uses_token_pool_runtime(tmp_path: Path) -> None:
         response = client.post(
             "/v1/chat/completions",
             json={
-                "model": "gpt-5.4",
+                "model": "gemini-3.1-pro",
                 "messages": [{"role": "user", "content": "Say hello."}],
             },
         )
@@ -452,18 +462,15 @@ def test_anthropic_non_stream_falls_back_to_responses_for_responses_only_models(
     state = {
         "token-1": {
             "name": "alpha",
-            "models": ["gpt-5.4"],
+            "models": ["mystery-responses-model"],
             "errors": [
                 make_http_error(
                     400,
-                    (
-                        '{"error":{"message":"model \\"gpt-5.4\\" is not accessible via '
-                        'the /chat/completions endpoint","code":"unsupported_api_for_model"}}'
-                    ),
+                    RESPONSES_ONLY_ERROR % "mystery-responses-model",
                 )
             ],
             "responses_result": {
-                "model": "gpt-5.4",
+                "model": "mystery-responses-model",
                 "output": [
                     {
                         "type": "message",
@@ -493,7 +500,7 @@ def test_anthropic_non_stream_falls_back_to_responses_for_responses_only_models(
         response = client.post(
             "/v1/messages",
             json={
-                "model": "gpt-5.4",
+                "model": "mystery-responses-model",
                 "max_tokens": 64,
                 "messages": [{"role": "user", "content": "Say hello."}],
             },
@@ -514,19 +521,16 @@ def test_anthropic_stream_falls_back_to_buffered_responses_for_responses_only_mo
     state = {
         "token-1": {
             "name": "alpha",
-            "models": ["gpt-5.4"],
+            "models": ["mystery-responses-model"],
             "errors": [],
             "stream_errors": [
                 make_http_error(
                     400,
-                    (
-                        '{"error":{"message":"model \\"gpt-5.4\\" is not accessible via '
-                        'the /chat/completions endpoint","code":"unsupported_api_for_model"}}'
-                    ),
+                    RESPONSES_ONLY_ERROR % "mystery-responses-model",
                 )
             ],
             "responses_result": {
-                "model": "gpt-5.4",
+                "model": "mystery-responses-model",
                 "output": [
                     {
                         "type": "message",
@@ -556,7 +560,7 @@ def test_anthropic_stream_falls_back_to_buffered_responses_for_responses_only_mo
         response = client.post(
             "/v1/messages",
             json={
-                "model": "gpt-5.4",
+                "model": "mystery-responses-model",
                 "max_tokens": 64,
                 "stream": True,
                 "messages": [{"role": "user", "content": "Say hello."}],
@@ -578,19 +582,16 @@ def test_openai_non_stream_falls_back_to_responses_for_responses_only_models(
     state = {
         "token-1": {
             "name": "alpha",
-            "models": ["gpt-5.4"],
+            "models": ["mystery-responses-model"],
             "errors": [
                 make_http_error(
                     400,
-                    (
-                        '{"error":{"message":"model \\"gpt-5.4\\" is not accessible via '
-                        'the /chat/completions endpoint","code":"unsupported_api_for_model"}}'
-                    ),
+                    RESPONSES_ONLY_ERROR % "mystery-responses-model",
                 )
             ],
             "responses_result": {
                 "id": "resp-openai-1",
-                "model": "gpt-5.4",
+                "model": "mystery-responses-model",
                 "output": [
                     {
                         "type": "message",
@@ -620,7 +621,7 @@ def test_openai_non_stream_falls_back_to_responses_for_responses_only_models(
         response = client.post(
             "/v1/chat/completions",
             json={
-                "model": "gpt-5.4",
+                "model": "mystery-responses-model",
                 "messages": [{"role": "user", "content": "Say hello."}],
             },
         )
@@ -642,20 +643,17 @@ def test_openai_stream_falls_back_to_responses_for_responses_only_models(
     state = {
         "token-1": {
             "name": "alpha",
-            "models": ["gpt-5.4"],
+            "models": ["mystery-responses-model"],
             "errors": [],
             "stream_errors": [
                 make_http_error(
                     400,
-                    (
-                        '{"error":{"message":"model \\"gpt-5.4\\" is not accessible via '
-                        'the /chat/completions endpoint","code":"unsupported_api_for_model"}}'
-                    ),
+                    RESPONSES_ONLY_ERROR % "mystery-responses-model",
                 )
             ],
             "responses_result": {
                 "id": "resp-openai-2",
-                "model": "gpt-5.4",
+                "model": "mystery-responses-model",
                 "output": [
                     {
                         "type": "message",
@@ -685,7 +683,7 @@ def test_openai_stream_falls_back_to_responses_for_responses_only_models(
         response = client.post(
             "/v1/chat/completions",
             json={
-                "model": "gpt-5.4",
+                "model": "mystery-responses-model",
                 "stream": True,
                 "messages": [{"role": "user", "content": "Say hello."}],
             },
@@ -738,10 +736,7 @@ def test_openai_fallback_to_responses_preserves_vision_flag(
             "errors": [
                 make_http_error(
                     400,
-                    (
-                        '{"error":{"message":"model \\"gpt-5.4\\" is not accessible via '
-                        'the /chat/completions endpoint","code":"unsupported_api_for_model"}}'
-                    ),
+                    RESPONSES_ONLY_ERROR % "gpt-5.4",
                 )
             ],
             "responses_result": {
@@ -816,7 +811,124 @@ def test_openai_fallback_to_responses_preserves_vision_flag(
     assert payload["input"][0]["content"][1]["type"] == "input_image"
 
 
-def test_responses_non_stream_falls_back_to_chat_completions_for_chat_only_models(
+def test_model_routing_registry_learns_and_infers_model_surfaces() -> None:
+    registry = ModelRoutingRegistry()
+
+    assert registry.preferred_api("gpt-5.4", "chat_completions") == "responses"
+    assert registry.preferred_api("claude-sonnet-4.6", "responses") == "chat_completions"
+
+    assert registry.preferred_api("mystery-model", "chat_completions") == "chat_completions"
+    registry.mark_api_unsupported("mystery-model", "chat_completions")
+    assert registry.preferred_api("mystery-model", "chat_completions") == "responses"
+
+
+def test_openai_route_prefers_responses_for_gpt5_without_chat_probe(
+    tmp_path: Path,
+) -> None:
+    repo, _ = make_repo(tmp_path)
+    repo.upsert_account(make_account("acct-1", "alpha", "gh-1", "token-1"))
+
+    state = {
+        "token-1": {
+            "name": "alpha",
+            "models": ["gpt-5.4"],
+            "errors": [],
+            "responses_result": {
+                "id": "resp-direct-1",
+                "model": "gpt-5.4",
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "direct responses ok"}],
+                    }
+                ],
+                "usage": {"input_tokens": 8, "output_tokens": 4},
+            },
+            "chat_calls": 0,
+        }
+    }
+
+    pool = TokenPool(
+        repo,
+        client_factory=lambda token, api_base: FakeCopilotClient(token, api_base, state),
+    )
+    app = create_app(pool)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "gpt-5.4",
+                "messages": [{"role": "user", "content": "Say hello."}],
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "direct responses ok"
+    assert state["token-1"]["chat_calls"] == 0
+    assert state["token-1"]["responses_calls"] == 1
+
+
+def test_openai_route_falls_back_to_requested_chat_surface_when_preferred_responses_fails(
+    tmp_path: Path,
+) -> None:
+    repo, _ = make_repo(tmp_path)
+    repo.upsert_account(make_account("acct-1", "alpha", "gh-1", "token-1"))
+
+    state = {
+        "token-1": {
+            "name": "alpha",
+            "models": ["gpt-5.4"],
+            "errors": [],
+            "responses_errors": [make_http_error(500, "temporary responses failure")],
+            "chat_result": {
+                "id": "chat-after-responses-failure-1",
+                "object": "chat.completion",
+                "created": 1772973003,
+                "model": "gpt-5.4",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": "chat fallback ok",
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 8,
+                    "completion_tokens": 3,
+                    "total_tokens": 11,
+                },
+            },
+            "chat_calls": 0,
+        }
+    }
+
+    pool = TokenPool(
+        repo,
+        client_factory=lambda token, api_base: FakeCopilotClient(token, api_base, state),
+    )
+    app = create_app(pool)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "gpt-5.4",
+                "messages": [{"role": "user", "content": "Say hello."}],
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "chat fallback ok"
+    assert state["token-1"]["responses_calls"] == 1
+    assert state["token-1"]["chat_calls"] == 1
+
+
+def test_responses_route_prefers_chat_for_claude_without_responses_probe(
     tmp_path: Path,
 ) -> None:
     repo, _ = make_repo(tmp_path)
@@ -827,20 +939,206 @@ def test_responses_non_stream_falls_back_to_chat_completions_for_chat_only_model
             "name": "alpha",
             "models": ["claude-sonnet-4.6"],
             "errors": [],
-            "responses_errors": [
+            "chat_result": {
+                "id": "chat-direct-1",
+                "object": "chat.completion",
+                "created": 1772973002,
+                "model": "claude-sonnet-4.6",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": "direct chat ok",
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 9,
+                    "completion_tokens": 3,
+                    "total_tokens": 12,
+                },
+            },
+            "chat_calls": 0,
+        }
+    }
+
+    pool = TokenPool(
+        repo,
+        client_factory=lambda token, api_base: FakeCopilotClient(token, api_base, state),
+    )
+    app = create_app(pool)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": "claude-sonnet-4.6",
+                "input": "Say hello.",
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["output"][0]["content"][0]["text"] == "direct chat ok"
+    assert state["token-1"].get("responses_calls", 0) == 0
+    assert state["token-1"]["chat_calls"] == 1
+
+
+def test_responses_route_preserves_apply_patch_tool_on_chat_surface(
+    tmp_path: Path,
+) -> None:
+    repo, _ = make_repo(tmp_path)
+    repo.upsert_account(make_account("acct-1", "alpha", "gh-1", "token-1"))
+
+    captured: dict[str, dict] = {}
+    state = {
+        "token-1": {
+            "name": "alpha",
+            "models": ["claude-sonnet-4.6"],
+            "errors": [],
+            "chat_result": {
+                "id": "chat-apply-patch-1",
+                "object": "chat.completion",
+                "created": 1772973004,
+                "model": "claude-sonnet-4.6",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": "tool ok",
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 7,
+                    "completion_tokens": 2,
+                    "total_tokens": 9,
+                },
+            },
+            "chat_calls": 0,
+        }
+    }
+
+    class CapturingClient(FakeCopilotClient):
+        async def chat_completions(self, payload: dict) -> dict:
+            captured["payload"] = copy.deepcopy(payload)
+            return await super().chat_completions(payload)
+
+    pool = TokenPool(
+        repo,
+        client_factory=lambda token, api_base: CapturingClient(token, api_base, state),
+    )
+    app = create_app(pool)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": "claude-sonnet-4.6",
+                "input": "Apply this patch.",
+                "tools": [
+                    {
+                        "type": "custom",
+                        "name": "apply_patch",
+                    }
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    assert captured["payload"]["tools"][0]["type"] == "function"
+    assert captured["payload"]["tools"][0]["function"]["name"] == "apply_patch"
+    assert state["token-1"]["chat_calls"] == 1
+
+
+def test_openai_route_learns_preferred_surface_after_first_fallback(
+    tmp_path: Path,
+) -> None:
+    repo, _ = make_repo(tmp_path)
+    repo.upsert_account(make_account("acct-1", "alpha", "gh-1", "token-1"))
+
+    state = {
+        "token-1": {
+            "name": "alpha",
+            "models": ["mystery-model"],
+            "errors": [
                 make_http_error(
                     400,
                     (
-                        '{"error":{"message":"model \\"claude-sonnet-4.6\\" '
-                        'does not support Responses API.","code":"unsupported_api_for_model"}}'
+                        '{"error":{"message":"model \\"mystery-model\\" is not accessible via '
+                        'the /chat/completions endpoint","code":"unsupported_api_for_model"}}'
                     ),
+                )
+            ],
+            "responses_result": {
+                "id": "resp-learned-1",
+                "model": "mystery-model",
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "learned ok"}],
+                    }
+                ],
+                "usage": {"input_tokens": 6, "output_tokens": 2},
+            },
+            "chat_calls": 0,
+        }
+    }
+
+    pool = TokenPool(
+        repo,
+        client_factory=lambda token, api_base: FakeCopilotClient(token, api_base, state),
+    )
+    app = create_app(pool)
+
+    with TestClient(app) as client:
+        first = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "mystery-model",
+                "messages": [{"role": "user", "content": "Say hello."}],
+            },
+        )
+        second = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "mystery-model",
+                "messages": [{"role": "user", "content": "Say hello again."}],
+            },
+        )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert state["token-1"]["chat_calls"] == 1
+    assert state["token-1"]["responses_calls"] == 2
+
+
+def test_responses_non_stream_falls_back_to_chat_completions_for_chat_only_models(
+    tmp_path: Path,
+) -> None:
+    repo, _ = make_repo(tmp_path)
+    repo.upsert_account(make_account("acct-1", "alpha", "gh-1", "token-1"))
+
+    state = {
+        "token-1": {
+            "name": "alpha",
+            "models": ["mystery-chat-model"],
+            "errors": [],
+            "responses_errors": [
+                make_http_error(
+                    400,
+                    CHAT_ONLY_ERROR % "mystery-chat-model",
                 )
             ],
             "chat_result": {
                 "id": "chat-fallback-1",
                 "object": "chat.completion",
                 "created": 1772973000,
-                "model": "claude-sonnet-4.6",
+                "model": "mystery-chat-model",
                 "choices": [
                     {
                         "index": 0,
@@ -872,13 +1170,13 @@ def test_responses_non_stream_falls_back_to_chat_completions_for_chat_only_model
     app = create_app(pool)
 
     with TestClient(app) as client:
-        response = client.post(
-            "/v1/responses",
-            json={
-                "model": "claude-sonnet-4.6",
-                "input": [
-                    {
-                        "role": "user",
+            response = client.post(
+                "/v1/responses",
+                json={
+                    "model": "mystery-chat-model",
+                    "input": [
+                        {
+                            "role": "user",
                         "content": [{"type": "input_text", "text": "Say hello."}],
                     }
                 ],
@@ -916,22 +1214,19 @@ def test_responses_stream_falls_back_to_chat_completions_for_chat_only_models(
     state = {
         "token-1": {
             "name": "alpha",
-            "models": ["gemini-3.1-pro-preview"],
+            "models": ["mystery-chat-model"],
             "errors": [],
             "responses_stream_errors": [
                 make_http_error(
                     400,
-                    (
-                        '{"error":{"message":"model \\"gemini-3.1-pro-preview\\" '
-                        'does not support Responses API.","code":"unsupported_api_for_model"}}'
-                    ),
+                    CHAT_ONLY_ERROR % "mystery-chat-model",
                 )
             ],
             "chat_result": {
                 "id": "chat-fallback-2",
                 "object": "chat.completion",
                 "created": 1772973001,
-                "model": "gemini-3.1-pro-preview",
+                "model": "mystery-chat-model",
                 "choices": [
                     {
                         "index": 0,
@@ -966,7 +1261,7 @@ def test_responses_stream_falls_back_to_chat_completions_for_chat_only_models(
         response = client.post(
             "/v1/responses",
             json={
-                "model": "gemini-3.1-pro-preview",
+                "model": "mystery-chat-model",
                 "stream": True,
                 "input": [
                     {
@@ -993,12 +1288,12 @@ def test_responses_route_strips_phase_metadata_from_input_items(tmp_path: Path) 
     state = {
         "token-1": {
             "name": "alpha",
-            "models": ["oswe-vscode-prime"],
+            "models": ["mystery-responses-model"],
             "errors": [],
             "responses_result": {
                 "id": "resp-phase-1",
                 "object": "response",
-                "model": "oswe-vscode-prime",
+                "model": "mystery-responses-model",
                 "output": [
                     {
                         "type": "message",
@@ -1038,7 +1333,7 @@ def test_responses_route_strips_phase_metadata_from_input_items(tmp_path: Path) 
         response = client.post(
             "/v1/responses",
             json={
-                "model": "oswe-vscode-prime",
+                "model": "mystery-responses-model",
                 "input": [
                     {
                         "role": "user",

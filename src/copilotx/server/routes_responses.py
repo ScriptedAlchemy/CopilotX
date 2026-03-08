@@ -23,7 +23,16 @@ from copilotx.proxy.translator import (
     openai_chat_to_responses_stream,
     openai_responses_to_chat_request,
 )
-from copilotx.server.app import run_with_runtime, stream_with_runtime
+from copilotx.server.app import probe_with_runtime, run_with_runtime, stream_with_runtime
+from copilotx.server.request_features import (
+    responses_request_has_vision_input,
+    responses_request_initiator,
+)
+from copilotx.server.runtime import CHAT_COMPLETIONS_API, RESPONSES_API
+from copilotx.server.upstream_compat import (
+    is_chat_completions_unsupported_for_model,
+    is_responses_unsupported_for_model,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -34,25 +43,6 @@ async def _prepend_first_chunk(first_chunk: bytes, stream):
     yield first_chunk
     async for chunk in stream:
         yield chunk
-
-
-def _should_fallback_to_chat_completions(exc: Exception) -> bool:
-    response = getattr(exc, "response", None)
-    if response is None or response.status_code != 400:
-        return False
-
-    try:
-        payload = json.loads(response.text)
-    except (json.JSONDecodeError, ValueError):
-        payload = {}
-
-    error = payload.get("error", {}) if isinstance(payload, dict) else {}
-    code = str(error.get("code", ""))
-    message = str(error.get("message", response.text)).lower()
-    return (
-        code == "unsupported_api_for_model"
-        or "does not support responses api" in message
-    )
 
 
 @router.post("/v1/responses")
@@ -66,16 +56,34 @@ async def responses(request: Request):
     normalize_responses_request(body)
 
     # Detect vision content and initiator role
-    vision = has_vision_input(body)
-    initiator = "agent" if has_agent_initiator(body) else "user"
+    vision = responses_request_has_vision_input(body)
+    initiator = responses_request_initiator(body)
     model = body.get("model")
-    chat_payload = openai_responses_to_chat_request(body)
+    runtime = request.app.state.runtime
+    preferred_api = runtime.preferred_api_surface(model, RESPONSES_API)
 
     # Patch apply_patch tool (custom → function type)
     patch_apply_patch_tool(body)
+    chat_payload = openai_responses_to_chat_request(body)
 
     try:
         if body.get("stream", False):
+            if preferred_api == CHAT_COMPLETIONS_API:
+                try:
+                    chat_result = await probe_with_runtime(
+                        request.app.state,
+                        model=model,
+                        operation=lambda client: client.chat_completions(
+                            deepcopy(chat_payload)
+                        ),
+                    )
+                    runtime.mark_api_success(model, CHAT_COMPLETIONS_API)
+                    return sse_response(openai_chat_to_responses_stream(chat_result, body))
+                except Exception as chat_error:
+                    if not is_chat_completions_unsupported_for_model(chat_error):
+                        raise
+                    runtime.mark_api_unsupported(model, CHAT_COMPLETIONS_API)
+
             try:
                 raw_stream = stream_with_runtime(
                     request.app.state,
@@ -87,10 +95,12 @@ async def responses(request: Request):
                 # Apply stream ID synchronization
                 fixed_stream = fix_responses_stream(raw_stream)
                 first_chunk = await anext(fixed_stream)
+                runtime.mark_api_success(model, RESPONSES_API)
                 return sse_response(_prepend_first_chunk(first_chunk, fixed_stream))
             except Exception as stream_error:
-                if not _should_fallback_to_chat_completions(stream_error):
+                if not is_responses_unsupported_for_model(stream_error):
                     raise
+                runtime.mark_api_unsupported(model, RESPONSES_API)
 
                 chat_result = await run_with_runtime(
                     request.app.state,
@@ -99,7 +109,24 @@ async def responses(request: Request):
                         deepcopy(chat_payload)
                     ),
                 )
+                runtime.mark_api_success(model, CHAT_COMPLETIONS_API)
                 return sse_response(openai_chat_to_responses_stream(chat_result, body))
+
+        if preferred_api == CHAT_COMPLETIONS_API:
+            try:
+                chat_result = await probe_with_runtime(
+                    request.app.state,
+                    model=model,
+                    operation=lambda client: client.chat_completions(
+                        deepcopy(chat_payload)
+                    ),
+                )
+                runtime.mark_api_success(model, CHAT_COMPLETIONS_API)
+                return JSONResponse(content=openai_chat_to_responses_response(chat_result, body))
+            except Exception as chat_error:
+                if not is_chat_completions_unsupported_for_model(chat_error):
+                    raise
+                runtime.mark_api_unsupported(model, CHAT_COMPLETIONS_API)
 
         try:
             result = await run_with_runtime(
@@ -109,10 +136,12 @@ async def responses(request: Request):
                     deepcopy(body), vision=vision, initiator=initiator
                 ),
             )
+            runtime.mark_api_success(model, RESPONSES_API)
             return JSONResponse(content=result)
         except Exception as non_stream_error:
-            if not _should_fallback_to_chat_completions(non_stream_error):
+            if not is_responses_unsupported_for_model(non_stream_error):
                 raise
+            runtime.mark_api_unsupported(model, RESPONSES_API)
 
             chat_result = await run_with_runtime(
                 request.app.state,
@@ -121,6 +150,7 @@ async def responses(request: Request):
                     deepcopy(chat_payload)
                 ),
             )
+            runtime.mark_api_success(model, CHAT_COMPLETIONS_API)
             return JSONResponse(content=openai_chat_to_responses_response(chat_result, body))
     except Exception as e:
         logger.error("Responses API error: %s", e)
@@ -139,55 +169,6 @@ async def responses(request: Request):
             except (json.JSONDecodeError, ValueError):
                 error_content["error"]["message"] = e.response.text[:500]
         return JSONResponse(status_code=status_code, content=error_content)
-
-
-# ═══════════════════════════════════════════════════════════════════
-#  Helper Functions
-# ═══════════════════════════════════════════════════════════════════
-
-
-def has_vision_input(body: dict) -> bool:
-    """Check if the request input contains image/vision content."""
-    input_data = body.get("input")
-    if not isinstance(input_data, list):
-        return False
-
-    for item in input_data:
-        if not isinstance(item, dict):
-            continue
-        # Check message content parts for images
-        content = item.get("content")
-        if isinstance(content, list):
-            for part in content:
-                if isinstance(part, dict) and part.get("type") in (
-                    "input_image",
-                    "image",
-                    "image_url",
-                ):
-                    return True
-    return False
-
-
-def has_agent_initiator(body: dict) -> bool:
-    """Check if the last input item indicates an agent (vs user) initiator."""
-    input_data = body.get("input")
-    if not isinstance(input_data, list) or not input_data:
-        return False
-
-    last_item = input_data[-1]
-    if not isinstance(last_item, dict):
-        return False
-
-    role = last_item.get("role", "").lower()
-    item_type = last_item.get("type", "").lower()
-
-    # Assistant messages and function-related items are agent-initiated
-    if role == "assistant":
-        return True
-    if item_type in ("function_call", "function_call_output", "reasoning"):
-        return True
-
-    return False
 
 
 def patch_apply_patch_tool(body: dict) -> None:
