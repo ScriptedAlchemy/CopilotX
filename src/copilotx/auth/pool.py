@@ -600,8 +600,8 @@ class TokenPool:
             except ValueError:
                 pass
             else:
-                if math.isfinite(cooldown):
-                    return max(cooldown, 0.0)
+                if math.isfinite(cooldown) and cooldown >= 0.0:
+                    return cooldown
             try:
                 retry_at = parsedate_to_datetime(retry_after)
             except (TypeError, ValueError, IndexError, OverflowError):
