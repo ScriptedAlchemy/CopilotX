@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import logging
+import math
 import time
 from dataclasses import dataclass, field
 from datetime import timezone
@@ -595,9 +596,12 @@ class TokenPool:
         retry_after = retry_after.strip()
         if retry_after:
             try:
-                return max(float(retry_after), 0.0)
+                cooldown = float(retry_after)
             except ValueError:
                 pass
+            else:
+                if math.isfinite(cooldown):
+                    return max(cooldown, 0.0)
             try:
                 retry_at = parsedate_to_datetime(retry_after)
             except (TypeError, ValueError, IndexError, OverflowError):
