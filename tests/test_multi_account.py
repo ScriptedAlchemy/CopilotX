@@ -4,6 +4,7 @@ import asyncio
 import copy
 import json
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
@@ -62,9 +63,14 @@ def make_repo(tmp_path: Path) -> tuple[AccountRepository, Path]:
     return repo, auth_path
 
 
-def make_http_error(status_code: int, message: str) -> httpx.HTTPStatusError:
+def make_http_error(
+    status_code: int,
+    message: str,
+    *,
+    headers: dict[str, str] | None = None,
+) -> httpx.HTTPStatusError:
     request = httpx.Request("POST", "https://upstream.test/v1/chat/completions")
-    response = httpx.Response(status_code, request=request, text=message)
+    response = httpx.Response(status_code, request=request, text=message, headers=headers)
     return httpx.HTTPStatusError(
         f"HTTP {status_code}: {message}",
         request=request,
@@ -1421,3 +1427,59 @@ def test_single_account_429_uses_shorter_fallback_cooldown(tmp_path: Path) -> No
     remaining = saved.cooldown_until - time.time()
     assert remaining > 0
     assert remaining <= 8.5
+
+
+def test_single_account_429_honors_http_date_retry_after(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(time, "time", lambda: 1000.0)
+
+    repo, _ = make_repo(tmp_path)
+    repo.upsert_account(make_account("acct-1", "alpha", "gh-1", "token-1"))
+    retry_after = datetime.fromtimestamp(1015, tz=timezone.utc).strftime(
+        "%a, %d %b %Y %H:%M:%S GMT"
+    )
+
+    state = {
+        "token-1": {
+            "name": "alpha",
+            "models": ["gpt-5.4"],
+            "errors": [
+                make_http_error(
+                    429,
+                    "rate limited",
+                    headers={"Retry-After": retry_after},
+                )
+            ],
+            "chat_calls": 0,
+        }
+    }
+
+    async def run() -> None:
+        pool = TokenPool(
+            repo,
+            client_factory=lambda token, api_base: FakeCopilotClient(
+                token,
+                api_base,
+                state,
+            ),
+        )
+        try:
+            await pool.execute(
+                model="gpt-5.4",
+                operation=lambda client: client.chat_completions({"model": "gpt-5.4"}),
+            )
+        finally:
+            await pool.__aexit__(None, None, None)
+
+    try:
+        asyncio.run(run())
+    except httpx.HTTPStatusError as exc:
+        assert exc.response.status_code == 429
+    else:
+        raise AssertionError("Expected a 429 error for the single-account pool")
+
+    saved = repo.get_account("acct-1")
+    assert saved is not None
+    remaining = saved.cooldown_until - time.time()
+    assert 14.5 <= remaining <= 15.0

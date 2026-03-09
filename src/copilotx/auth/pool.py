@@ -7,6 +7,8 @@ import copy
 import logging
 import time
 from dataclasses import dataclass, field
+from datetime import timezone
+from email.utils import parsedate_to_datetime
 from typing import Any, AsyncIterator, Awaitable, Callable
 
 import httpx
@@ -590,8 +592,20 @@ class TokenPool:
         return cooldown_until > current_time
 
     def _rate_limit_cooldown(self, retry_after: str) -> float:
-        if retry_after.isdigit():
-            return float(retry_after)
+        retry_after = retry_after.strip()
+        if retry_after:
+            try:
+                return max(float(retry_after), 0.0)
+            except ValueError:
+                pass
+            try:
+                retry_at = parsedate_to_datetime(retry_after)
+            except (TypeError, ValueError, IndexError, OverflowError):
+                retry_at = None
+            if retry_at is not None:
+                if retry_at.tzinfo is None:
+                    retry_at = retry_at.replace(tzinfo=timezone.utc)
+                return max(retry_at.timestamp() - time.time(), 0.0)
         if self._healthy_enabled_account_count() <= 1:
             return float(POOL_SINGLE_ACCOUNT_429_COOLDOWN)
         return float(POOL_429_COOLDOWN)
