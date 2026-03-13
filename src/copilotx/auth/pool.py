@@ -22,8 +22,20 @@ from copilotx.config import (
     TOKEN_REFRESH_BUFFER,
 )
 from copilotx.proxy.client import CopilotClient
+from copilotx.server.upstream_compat import (
+    is_chat_completions_unsupported_for_model,
+    is_responses_unsupported_for_model,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _is_retryable_model_support_error(exc: Exception) -> bool:
+    """Return True when another account may still satisfy the requested model."""
+    return (
+        is_chat_completions_unsupported_for_model(exc)
+        or is_responses_unsupported_for_model(exc)
+    )
 
 
 class PoolError(Exception):
@@ -513,6 +525,13 @@ class TokenPool:
 
         if isinstance(exc, httpx.HTTPStatusError):
             status_code = exc.response.status_code
+            if status_code == 400 and _is_retryable_model_support_error(exc):
+                self.repository.mark_account(
+                    entry.account.account_id,
+                    last_error=str(exc),
+                    last_error_at=now,
+                )
+                return RetryDecision(retry_other_account=True)
             if status_code == 401:
                 if not lease.force_refreshed:
                     return RetryDecision(retry_same_account=True)
