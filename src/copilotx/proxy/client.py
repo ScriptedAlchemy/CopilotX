@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from typing import Any, AsyncIterator
 
@@ -19,6 +20,75 @@ from copilotx.config import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _forced_model_ids() -> list[str]:
+    raw = os.environ.get("COPILOTX_FORCE_MODELS", "")
+    if not raw:
+        return []
+
+    model_ids: list[str] = []
+    seen: set[str] = set()
+    for chunk in raw.replace(",", " ").split():
+        model_id = chunk.strip()
+        if not model_id or model_id in seen:
+            continue
+        seen.add(model_id)
+        model_ids.append(model_id)
+    return model_ids
+
+
+def _infer_model_vendor(model_id: str) -> str:
+    model_lower = model_id.lower()
+    if model_lower.startswith("claude-"):
+        return "Anthropic"
+    if model_lower.startswith("gemini-"):
+        return "Google"
+    if model_lower.startswith("grok-"):
+        return "xAI"
+    if model_lower.startswith("gpt-") or "codex" in model_lower:
+        return "OpenAI"
+    return "github-copilot"
+
+
+def merge_forced_models(models: list[dict]) -> list[dict]:
+    """Merge manually forced model IDs into a model catalog.
+
+    This keeps caller-supplied models intact and appends placeholders for any
+    forced IDs missing from the upstream catalog.
+    """
+    forced_model_ids = _forced_model_ids()
+    forced_model_id_set = set(forced_model_ids)
+
+    merged_models: list[dict] = []
+    seen_model_ids: set[str] = set()
+    for model in models:
+        if not isinstance(model, dict):
+            continue
+        model_id = str(model.get("id", "")).strip()
+        if not model_id or model_id in seen_model_ids:
+            continue
+        normalized_model = dict(model)
+        if model_id in forced_model_id_set:
+            normalized_model["copilotx_forced"] = True
+        seen_model_ids.add(model_id)
+        merged_models.append(normalized_model)
+
+    for model_id in forced_model_ids:
+        if model_id in seen_model_ids:
+            continue
+        seen_model_ids.add(model_id)
+        merged_models.append(
+            {
+                "id": model_id,
+                "name": model_id,
+                "vendor": _infer_model_vendor(model_id),
+                "model_picker_enabled": False,
+                "copilotx_forced": True,
+            }
+        )
+
+    return merged_models
 
 
 class CopilotClient:
@@ -62,7 +132,12 @@ class CopilotClient:
     # ── Models ──────────────────────────────────────────────────────
 
     async def list_models(self) -> list[dict]:
-        """GET /models — returns list of available models (cached)."""
+        """GET /models — returns all upstream models (cached).
+
+        GitHub sometimes keeps models callable while hiding them from the official
+        picker (`model_picker_enabled=false`). CopilotX must still learn about
+        those models so manual requests and pool routing can use them.
+        """
         now = time.time()
         if self._models_cache and (now - self._models_cache_time) < MODELS_CACHE_TTL:
             return self._models_cache
@@ -73,11 +148,8 @@ class CopilotClient:
         resp.raise_for_status()
         data = resp.json()
 
-        models = [
-            m
-            for m in data.get("data", data.get("models", []))
-            if m.get("model_picker_enabled", True)
-        ]
+        raw_models = data.get("data", data.get("models", []))
+        models = merge_forced_models(raw_models)
         self._models_cache = models
         self._models_cache_time = now
         return models

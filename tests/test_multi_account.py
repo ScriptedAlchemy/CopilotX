@@ -14,6 +14,7 @@ from rich.console import Console
 import copilotx.cli as cli_module
 from copilotx.auth.accounts import AccountRecord, AccountRepository
 from copilotx.auth.pool import TokenPool
+from copilotx.proxy.client import merge_forced_models
 from copilotx.proxy.translator import openai_responses_to_chat_request
 from copilotx.server.app import create_app
 from copilotx.server.runtime import ModelRoutingRegistry
@@ -164,6 +165,499 @@ class FakeCopilotClient:
             raise account["responses_stream_errors"].pop(0)
         for chunk in account.get("responses_stream_chunks", []):
             yield chunk
+
+
+class HiddenModelCopilotClient(FakeCopilotClient):
+    async def list_models(self) -> list[dict]:
+        return copy.deepcopy(self.state[self.token]["models"])
+
+
+class ForceAwareCopilotClient(HiddenModelCopilotClient):
+    async def list_models(self) -> list[dict]:
+        raw_models = copy.deepcopy(self.state[self.token]["models"])
+        return merge_forced_models(raw_models)
+
+
+def test_models_route_includes_hidden_models_from_upstream_catalog(
+    tmp_path: Path,
+) -> None:
+    repo, _ = make_repo(tmp_path)
+    repo.upsert_account(make_account("acct-1", "alpha", "gh-1", "token-1"))
+
+    state = {
+        "token-1": {
+            "name": "alpha",
+            "models": [
+                {"id": "gpt-5.4", "vendor": "OpenAI", "model_picker_enabled": False},
+                {
+                    "id": "claude-opus-4.6",
+                    "vendor": "Anthropic",
+                    "model_picker_enabled": False,
+                },
+            ],
+            "errors": [],
+            "chat_calls": 0,
+        }
+    }
+
+    pool = TokenPool(
+        repo,
+        client_factory=lambda token, api_base: HiddenModelCopilotClient(
+            token,
+            api_base,
+            state,
+        ),
+    )
+    app = create_app(pool)
+
+    with TestClient(app) as client:
+        response = client.get("/v1/models")
+
+    assert response.status_code == 200
+    ids = {model["id"] for model in response.json()["data"]}
+    assert "gpt-5.4" in ids
+    assert "claude-opus-4.6" in ids
+
+
+def test_token_pool_can_use_hidden_models_when_requested_explicitly(
+    tmp_path: Path,
+) -> None:
+    repo, _ = make_repo(tmp_path)
+    repo.upsert_account(make_account("acct-1", "alpha", "gh-1", "token-1"))
+
+    state = {
+        "token-1": {
+            "name": "alpha",
+            "models": [
+                {"id": "gpt-5.4", "vendor": "OpenAI", "model_picker_enabled": False},
+            ],
+            "errors": [],
+            "chat_calls": 0,
+            "responses_result": {
+                "id": "resp-hidden-1",
+                "model": "gpt-5.4",
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "hidden ok"}],
+                    }
+                ],
+            },
+        }
+    }
+
+    async def run() -> dict:
+        pool = TokenPool(
+            repo,
+            client_factory=lambda token, api_base: HiddenModelCopilotClient(
+                token,
+                api_base,
+                state,
+            ),
+        )
+        try:
+            await pool.sync_accounts(force=True)
+            return await pool.execute(
+                model="gpt-5.4",
+                operation=lambda client: client.responses(
+                    {
+                        "model": "gpt-5.4",
+                        "input": "Say hello.",
+                        "max_output_tokens": 16,
+                    }
+                ),
+            )
+        finally:
+            await pool.__aexit__(None, None, None)
+
+    result = asyncio.run(run())
+
+    assert result["model"] == "gpt-5.4"
+    assert state["token-1"]["responses_calls"] == 1
+
+
+def test_merge_forced_models_appends_missing_manual_ids(monkeypatch) -> None:
+    monkeypatch.setenv("COPILOTX_FORCE_MODELS", "gpt-5.4, claude-opus-4.6")
+
+    merged = merge_forced_models(
+        [
+            {
+                "id": "gpt-4o",
+                "vendor": "Azure OpenAI",
+                "model_picker_enabled": True,
+            }
+        ]
+    )
+
+    by_id = {model["id"]: model for model in merged}
+    assert by_id["gpt-4o"]["vendor"] == "Azure OpenAI"
+    assert by_id["gpt-5.4"]["vendor"] == "OpenAI"
+    assert by_id["gpt-5.4"]["copilotx_forced"] is True
+    assert by_id["gpt-5.4"]["model_picker_enabled"] is False
+    assert by_id["claude-opus-4.6"]["vendor"] == "Anthropic"
+
+
+def test_models_route_includes_forced_models_missing_from_upstream_catalog(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    repo, _ = make_repo(tmp_path)
+    repo.upsert_account(make_account("acct-1", "alpha", "gh-1", "token-1"))
+    monkeypatch.setenv("COPILOTX_FORCE_MODELS", "gpt-5.4, claude-opus-4.6")
+
+    state = {
+        "token-1": {
+            "name": "alpha",
+            "models": [
+                {
+                    "id": "gpt-4o",
+                    "vendor": "Azure OpenAI",
+                    "model_picker_enabled": True,
+                }
+            ],
+            "errors": [],
+            "chat_calls": 0,
+        }
+    }
+
+    pool = TokenPool(
+        repo,
+        client_factory=lambda token, api_base: ForceAwareCopilotClient(
+            token,
+            api_base,
+            state,
+        ),
+    )
+    app = create_app(pool)
+
+    with TestClient(app) as client:
+        response = client.get("/v1/models")
+
+    assert response.status_code == 200
+    ids = {model["id"] for model in response.json()["data"]}
+    assert "gpt-4o" in ids
+    assert "gpt-5.4" in ids
+    assert "claude-opus-4.6" in ids
+
+
+def test_token_pool_can_use_forced_model_missing_from_upstream_catalog(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    repo, _ = make_repo(tmp_path)
+    repo.upsert_account(
+        make_account(
+            "acct-1",
+            "alpha",
+            "gh-1",
+            "token-1",
+            model_ids=["gpt-4o"],
+        )
+    )
+    monkeypatch.setenv("COPILOTX_FORCE_MODELS", "gpt-5.4")
+
+    state = {
+        "token-1": {
+            "name": "alpha",
+            "models": [
+                {
+                    "id": "gpt-4o",
+                    "vendor": "Azure OpenAI",
+                    "model_picker_enabled": True,
+                }
+            ],
+            "errors": [],
+            "chat_calls": 0,
+            "responses_result": {
+                "id": "resp-forced-1",
+                "model": "gpt-5.4",
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "forced ok"}],
+                    }
+                ],
+            },
+        }
+    }
+
+    async def run() -> dict:
+        pool = TokenPool(
+            repo,
+            client_factory=lambda token, api_base: ForceAwareCopilotClient(
+                token,
+                api_base,
+                state,
+            ),
+        )
+        try:
+            await pool.sync_accounts(force=True)
+            return await pool.execute(
+                model="gpt-5.4",
+                operation=lambda client: client.responses(
+                    {
+                        "model": "gpt-5.4",
+                        "input": "Say hello.",
+                        "max_output_tokens": 16,
+                    }
+                ),
+            )
+        finally:
+            await pool.__aexit__(None, None, None)
+
+    result = asyncio.run(run())
+
+    assert result["model"] == "gpt-5.4"
+    assert state["token-1"]["responses_calls"] == 1
+
+
+def test_token_pool_retries_other_account_for_forced_model_when_first_account_rejects_it(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    repo, _ = make_repo(tmp_path)
+    repo.upsert_account(
+        make_account(
+            "acct-1",
+            "alpha",
+            "gh-1",
+            "token-1",
+            model_ids=["gpt-4o"],
+        )
+    )
+    repo.upsert_account(
+        make_account(
+            "acct-2",
+            "beta",
+            "gh-2",
+            "token-2",
+            model_ids=["gpt-4o"],
+        )
+    )
+    monkeypatch.setenv("COPILOTX_FORCE_MODELS", "gpt-5.4")
+
+    state = {
+        "token-1": {
+            "name": "alpha",
+            "models": [{"id": "gpt-4o", "vendor": "Azure OpenAI"}],
+            "errors": [],
+            "chat_calls": 0,
+            "responses_errors": [make_http_error(400, CHAT_ONLY_ERROR % "gpt-5.4")],
+        },
+        "token-2": {
+            "name": "beta",
+            "models": [{"id": "gpt-4o", "vendor": "Azure OpenAI"}],
+            "errors": [],
+            "chat_calls": 0,
+            "responses_result": {
+                "id": "resp-forced-2",
+                "model": "gpt-5.4",
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "fallback ok"}],
+                    }
+                ],
+            },
+        },
+    }
+
+    async def run() -> dict:
+        pool = TokenPool(
+            repo,
+            client_factory=lambda token, api_base: ForceAwareCopilotClient(
+                token,
+                api_base,
+                state,
+            ),
+        )
+        try:
+            await pool.sync_accounts(force=True)
+            return await pool.execute(
+                model="gpt-5.4",
+                operation=lambda client: client.responses(
+                    {
+                        "model": "gpt-5.4",
+                        "input": "Say hello.",
+                        "max_output_tokens": 16,
+                    }
+                ),
+            )
+        finally:
+            await pool.__aexit__(None, None, None)
+
+    result = asyncio.run(run())
+
+    assert result["model"] == "gpt-5.4"
+    assert state["token-1"]["responses_calls"] == 1
+    assert state["token-2"]["responses_calls"] == 1
+
+
+def test_token_pool_retries_all_accounts_for_forced_model_support_errors(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    repo, _ = make_repo(tmp_path)
+    for index, token in enumerate(("token-1", "token-2", "token-3", "token-4"), start=1):
+        repo.upsert_account(
+            make_account(
+                f"acct-{index}",
+                f"acct-{index}",
+                f"gh-{index}",
+                token,
+                model_ids=["gpt-4o"],
+            )
+        )
+    monkeypatch.setenv("COPILOTX_FORCE_MODELS", "gpt-5.4")
+
+    state = {
+        "token-1": {
+            "name": "alpha",
+            "models": [{"id": "gpt-4o", "vendor": "Azure OpenAI"}],
+            "errors": [],
+            "chat_calls": 0,
+            "responses_errors": [make_http_error(400, CHAT_ONLY_ERROR % "gpt-5.4")],
+        },
+        "token-2": {
+            "name": "beta",
+            "models": [{"id": "gpt-4o", "vendor": "Azure OpenAI"}],
+            "errors": [],
+            "chat_calls": 0,
+            "responses_errors": [make_http_error(400, CHAT_ONLY_ERROR % "gpt-5.4")],
+        },
+        "token-3": {
+            "name": "gamma",
+            "models": [{"id": "gpt-4o", "vendor": "Azure OpenAI"}],
+            "errors": [],
+            "chat_calls": 0,
+            "responses_errors": [make_http_error(400, CHAT_ONLY_ERROR % "gpt-5.4")],
+        },
+        "token-4": {
+            "name": "delta",
+            "models": [{"id": "gpt-4o", "vendor": "Azure OpenAI"}],
+            "errors": [],
+            "chat_calls": 0,
+            "responses_result": {
+                "id": "resp-forced-4",
+                "model": "gpt-5.4",
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "fourth account ok"}],
+                    }
+                ],
+            },
+        },
+    }
+
+    async def run() -> dict:
+        pool = TokenPool(
+            repo,
+            client_factory=lambda token, api_base: ForceAwareCopilotClient(
+                token,
+                api_base,
+                state,
+            ),
+        )
+        try:
+            await pool.sync_accounts(force=True)
+            return await pool.execute(
+                model="gpt-5.4",
+                operation=lambda client: client.responses(
+                    {
+                        "model": "gpt-5.4",
+                        "input": "Say hello.",
+                        "max_output_tokens": 16,
+                    }
+                ),
+            )
+        finally:
+            await pool.__aexit__(None, None, None)
+
+    result = asyncio.run(run())
+
+    assert result["model"] == "gpt-5.4"
+    assert state["token-1"]["responses_calls"] == 1
+    assert state["token-2"]["responses_calls"] == 1
+    assert state["token-3"]["responses_calls"] == 1
+    assert state["token-4"]["responses_calls"] == 1
+
+
+def test_responses_stream_route_falls_back_after_single_account_forced_model_rejection(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    repo, _ = make_repo(tmp_path)
+    repo.upsert_account(
+        make_account(
+            "acct-1",
+            "alpha",
+            "gh-1",
+            "token-1",
+            model_ids=["gpt-4o"],
+        )
+    )
+    monkeypatch.setenv("COPILOTX_FORCE_MODELS", "gpt-5.4")
+
+    state = {
+        "token-1": {
+            "name": "alpha",
+            "models": [{"id": "gpt-4o", "vendor": "Azure OpenAI"}],
+            "errors": [],
+            "chat_calls": 0,
+            "responses_stream_errors": [make_http_error(400, CHAT_ONLY_ERROR % "gpt-5.4")],
+            "chat_result": {
+                "id": "chat-fallback-1",
+                "object": "chat.completion",
+                "created": 1772973005,
+                "model": "gpt-5.4",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": "stream fallback ok",
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 7,
+                    "completion_tokens": 3,
+                    "total_tokens": 10,
+                },
+            },
+        }
+    }
+
+    pool = TokenPool(
+        repo,
+        client_factory=lambda token, api_base: ForceAwareCopilotClient(
+            token,
+            api_base,
+            state,
+        ),
+    )
+    app = create_app(pool)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": "gpt-5.4",
+                "input": "Say hello.",
+                "stream": True,
+            },
+        )
+
+    assert response.status_code == 200
+    assert "stream fallback ok" in response.text
+    assert state["token-1"]["responses_stream_calls"] == 1
+    assert state["token-1"]["chat_calls"] == 1
 
 
 def test_disabling_last_enabled_account_removes_legacy_auth(tmp_path: Path) -> None:

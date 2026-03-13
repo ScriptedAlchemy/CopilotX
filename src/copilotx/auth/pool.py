@@ -26,8 +26,20 @@ from copilotx.config import (
     TOKEN_REFRESH_BUFFER,
 )
 from copilotx.proxy.client import CopilotClient
+from copilotx.server.upstream_compat import (
+    is_chat_completions_unsupported_for_model,
+    is_responses_unsupported_for_model,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _is_retryable_model_support_error(exc: Exception) -> bool:
+    """Return True when another account may still satisfy the requested model."""
+    return (
+        is_chat_completions_unsupported_for_model(exc)
+        or is_responses_unsupported_for_model(exc)
+    )
 
 
 class PoolError(Exception):
@@ -44,6 +56,7 @@ class RetryDecision:
 
     retry_same_account: bool = False
     retry_other_account: bool = False
+    retry_all_candidates: bool = False
     reauth_required: bool = False
     cooldown_seconds: float = 0.0
 
@@ -297,6 +310,17 @@ class TokenPool:
             "strategy": self.repository.get_rotation_strategy(),
         }
 
+    def _attempt_limit(self, model: str | None, *, exhaust_candidates: bool = False) -> int:
+        candidate_count = sum(
+            1
+            for entry in self._candidate_entries(model=model, exclude_account_ids=set())
+            if entry.account.enabled and not entry.account.reauth_required and not entry.removed
+        )
+        candidate_count = max(candidate_count, 1)
+        if exhaust_candidates:
+            return candidate_count
+        return max(1, min(POOL_MAX_RETRY_ATTEMPTS, candidate_count))
+
     async def execute(
         self,
         *,
@@ -306,14 +330,22 @@ class TokenPool:
         await self.sync_accounts()
         tried: set[str] = set()
         last_error: Exception | None = None
-        max_attempts = max(1, min(POOL_MAX_RETRY_ATTEMPTS, max(len(self.entries), 1)))
+        max_attempts = self._attempt_limit(model)
+        attempts = 0
 
-        for _ in range(max_attempts):
-            lease = await self.acquire(
-                model=model,
-                is_stream=False,
-                exclude_account_ids=tried,
-            )
+        while attempts < max_attempts:
+            try:
+                lease = await self.acquire(
+                    model=model,
+                    is_stream=False,
+                    exclude_account_ids=tried,
+                )
+            except Exception:
+                if last_error is not None:
+                    raise last_error
+                raise
+
+            attempts += 1
             try:
                 result = await operation(lease.client)
                 await self._mark_success(lease.entry)
@@ -321,6 +353,11 @@ class TokenPool:
             except Exception as exc:
                 decision = await self._handle_request_error(lease, exc)
                 last_error = exc
+                if decision.retry_all_candidates:
+                    max_attempts = max(
+                        max_attempts,
+                        self._attempt_limit(model, exhaust_candidates=True),
+                    )
                 if decision.retry_same_account and not lease.force_refreshed:
                     lease.force_refreshed = True
                     try:
@@ -331,6 +368,11 @@ class TokenPool:
                     except Exception as retry_exc:
                         last_error = retry_exc
                         decision = await self._handle_request_error(lease, retry_exc)
+                        if decision.retry_all_candidates:
+                            max_attempts = max(
+                                max_attempts,
+                                self._attempt_limit(model, exhaust_candidates=True),
+                            )
 
                 tried.add(lease.account_id)
                 if not decision.retry_other_account:
@@ -368,16 +410,23 @@ class TokenPool:
     ) -> AsyncIterator[bytes]:
         await self.sync_accounts()
         tried: set[str] = set()
-        max_attempts = max(1, min(POOL_MAX_RETRY_ATTEMPTS, max(len(self.entries), 1)))
+        last_error: Exception | None = None
+        max_attempts = self._attempt_limit(model)
         attempts = 0
 
         while attempts < max_attempts:
+            try:
+                lease = await self.acquire(
+                    model=model,
+                    is_stream=True,
+                    exclude_account_ids=tried,
+                )
+            except Exception:
+                if last_error is not None:
+                    raise last_error
+                raise
+
             attempts += 1
-            lease = await self.acquire(
-                model=model,
-                is_stream=True,
-                exclude_account_ids=tried,
-            )
             yielded = False
             try:
                 async for chunk in operation(lease.client):
@@ -387,6 +436,12 @@ class TokenPool:
                 return
             except Exception as exc:
                 decision = await self._handle_request_error(lease, exc)
+                last_error = exc
+                if decision.retry_all_candidates:
+                    max_attempts = max(
+                        max_attempts,
+                        self._attempt_limit(model, exhaust_candidates=True),
+                    )
                 if yielded:
                     raise
                 if decision.retry_same_account and not lease.force_refreshed:
@@ -399,7 +454,13 @@ class TokenPool:
                         await self._mark_success(lease.entry)
                         return
                     except Exception as retry_exc:
+                        last_error = retry_exc
                         decision = await self._handle_request_error(lease, retry_exc)
+                        if decision.retry_all_candidates:
+                            max_attempts = max(
+                                max_attempts,
+                                self._attempt_limit(model, exhaust_candidates=True),
+                            )
                         if yielded or not decision.retry_other_account:
                             raise
                 if not decision.retry_other_account:
@@ -408,7 +469,7 @@ class TokenPool:
             finally:
                 await lease.release()
 
-        raise PoolError("No upstream account could open the requested stream.")
+        raise last_error or PoolError("No upstream account could open the requested stream.")
 
     # ── Internal Helpers ────────────────────────────────────────────
 
@@ -518,6 +579,13 @@ class TokenPool:
 
         if isinstance(exc, httpx.HTTPStatusError):
             status_code = exc.response.status_code
+            if status_code == 400 and _is_retryable_model_support_error(exc):
+                self.repository.mark_account(
+                    entry.account.account_id,
+                    last_error=str(exc),
+                    last_error_at=now,
+                )
+                return RetryDecision(retry_other_account=True, retry_all_candidates=True)
             if status_code == 401:
                 if not lease.force_refreshed:
                     return RetryDecision(retry_same_account=True)
