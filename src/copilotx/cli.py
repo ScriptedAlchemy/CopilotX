@@ -51,6 +51,12 @@ def _format_duration(seconds: int) -> str:
     return f"{secs}s"
 
 
+def _format_age(timestamp: float, now: float) -> str:
+    if timestamp <= 0:
+        return "-"
+    return f"{_format_duration(int(now - timestamp))} ago"
+
+
 def _render_account_table(repo) -> None:
     from copilotx.config import TOKEN_REFRESH_BUFFER
 
@@ -70,10 +76,13 @@ def _render_account_table(repo) -> None:
     table.add_column("Account", style="cyan", no_wrap=True)
     table.add_column("GitHub", style="white")
     table.add_column("State", style="white")
+    table.add_column("Cooldown", style="white")
+    table.add_column("Last 429", style="white")
     table.add_column("Token", style="dim")
     table.add_column("Priority", style="dim", justify="right")
 
     for account in accounts:
+        cooldown_remaining = max(int(account.cooldown_until - now), 0)
         is_valid = (
             bool(account.copilot_token)
             and account.expires_at > now + TOKEN_REFRESH_BUFFER
@@ -91,6 +100,8 @@ def _render_account_table(repo) -> None:
             state = "disabled"
         elif account.reauth_required:
             state = "reauth required"
+        elif cooldown_remaining > 0:
+            state = "cooling down"
         elif account.last_error:
             state = "degraded"
 
@@ -102,6 +113,8 @@ def _render_account_table(repo) -> None:
             account_name,
             account.github_login or "legacy",
             state,
+            _format_duration(cooldown_remaining) if cooldown_remaining > 0 else "-",
+            _format_age(account.last_rate_limited_at, now),
             token_state,
             str(account.priority),
         )

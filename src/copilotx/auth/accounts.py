@@ -40,6 +40,8 @@ class AccountRecord:
     last_used_at: float = 0.0
     last_error: str = ""
     last_error_at: float = 0.0
+    cooldown_until: float = 0.0
+    last_rate_limited_at: float = 0.0
     created_at: float = 0.0
     updated_at: float = 0.0
 
@@ -113,8 +115,8 @@ class AccountRepository:
                         account_id, github_login, github_user_id, label, github_token,
                         copilot_token, expires_at, api_base_url, enabled, reauth_required,
                         priority, model_ids_json, last_used_at, last_error, last_error_at,
-                        created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        cooldown_until, last_rate_limited_at, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         account.account_id,
@@ -132,6 +134,8 @@ class AccountRepository:
                         account.last_used_at,
                         account.last_error,
                         account.last_error_at,
+                        account.cooldown_until,
+                        account.last_rate_limited_at,
                         account.created_at,
                         account.updated_at,
                     ),
@@ -160,6 +164,8 @@ class AccountRepository:
                     last_used_at = ?,
                     last_error = ?,
                     last_error_at = ?,
+                    cooldown_until = ?,
+                    last_rate_limited_at = ?,
                     updated_at = ?
                 WHERE account_id = ?
                 """,
@@ -177,6 +183,8 @@ class AccountRepository:
                     account.last_used_at or existing.last_used_at,
                     account.last_error,
                     account.last_error_at,
+                    account.cooldown_until or existing.cooldown_until,
+                    account.last_rate_limited_at or existing.last_rate_limited_at,
                     now,
                     existing.account_id,
                 ),
@@ -283,6 +291,8 @@ class AccountRepository:
         last_used_at: float | None = None,
         last_error: str | None = None,
         last_error_at: float | None = None,
+        cooldown_until: float | None = None,
+        last_rate_limited_at: float | None = None,
     ) -> None:
         account = self.get_account(account_id)
         if account is None:
@@ -295,6 +305,8 @@ class AccountRepository:
                     last_used_at = ?,
                     last_error = ?,
                     last_error_at = ?,
+                    cooldown_until = ?,
+                    last_rate_limited_at = ?,
                     updated_at = ?
                 WHERE account_id = ?
                 """,
@@ -303,6 +315,12 @@ class AccountRepository:
                     account.last_used_at if last_used_at is None else last_used_at,
                     account.last_error if last_error is None else last_error,
                     account.last_error_at if last_error_at is None else last_error_at,
+                    account.cooldown_until if cooldown_until is None else cooldown_until,
+                    (
+                        account.last_rate_limited_at
+                        if last_rate_limited_at is None
+                        else last_rate_limited_at
+                    ),
                     time.time(),
                     account_id,
                 ),
@@ -399,6 +417,8 @@ class AccountRepository:
                     last_used_at REAL NOT NULL DEFAULT 0,
                     last_error TEXT NOT NULL DEFAULT '',
                     last_error_at REAL NOT NULL DEFAULT 0,
+                    cooldown_until REAL NOT NULL DEFAULT 0,
+                    last_rate_limited_at REAL NOT NULL DEFAULT 0,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL
                 )
@@ -412,6 +432,18 @@ class AccountRepository:
                     updated_at REAL NOT NULL
                 )
                 """
+            )
+            self._ensure_column(
+                conn,
+                "accounts",
+                "cooldown_until",
+                "REAL NOT NULL DEFAULT 0",
+            )
+            self._ensure_column(
+                conn,
+                "accounts",
+                "last_rate_limited_at",
+                "REAL NOT NULL DEFAULT 0",
             )
 
     def _migrate_legacy_auth(self) -> None:
@@ -504,9 +536,23 @@ class AccountRepository:
             last_used_at=float(row["last_used_at"]),
             last_error=str(row["last_error"]),
             last_error_at=float(row["last_error_at"]),
+            cooldown_until=float(row["cooldown_until"]),
+            last_rate_limited_at=float(row["last_rate_limited_at"]),
             created_at=float(row["created_at"]),
             updated_at=float(row["updated_at"]),
         )
+
+    @staticmethod
+    def _ensure_column(
+        conn: sqlite3.Connection,
+        table: str,
+        column: str,
+        column_sql: str,
+    ) -> None:
+        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+        if any(str(row["name"]) == column for row in rows):
+            return
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_sql}")
 
     def _ensure_dir(self) -> None:
         COPILOTX_DIR.mkdir(parents=True, exist_ok=True)

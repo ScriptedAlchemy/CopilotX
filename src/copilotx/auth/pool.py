@@ -5,8 +5,11 @@ from __future__ import annotations
 import asyncio
 import copy
 import logging
+import math
 import time
 from dataclasses import dataclass, field
+from datetime import timezone
+from email.utils import parsedate_to_datetime
 from typing import Any, AsyncIterator, Awaitable, Callable
 
 import httpx
@@ -17,6 +20,7 @@ from copilotx.config import (
     POOL_429_COOLDOWN,
     POOL_FAILURE_COOLDOWN,
     POOL_MAX_RETRY_ATTEMPTS,
+    POOL_SINGLE_ACCOUNT_429_COOLDOWN,
     POOL_SYNC_INTERVAL,
     ROTATION_STRATEGIES,
     TOKEN_REFRESH_BUFFER,
@@ -164,6 +168,7 @@ class TokenPool:
             if account_id in self.entries:
                 entry = self.entries[account_id]
                 entry.account = account
+                entry.cooldown_until = max(entry.cooldown_until, account.cooldown_until)
                 entry.removed = False
             else:
                 self.entries[account_id] = PoolEntry(
@@ -197,13 +202,13 @@ class TokenPool:
             entry_error: Exception | None = None
             if not entry.account.enabled or entry.account.reauth_required or entry.removed:
                 continue
-            if entry.cooldown_until > time.time():
+            if self._cooldown_active(entry):
                 continue
 
             async with self._selection_lock:
                 if entry.removed or not entry.account.enabled or entry.account.reauth_required:
                     continue
-                if entry.cooldown_until > time.time():
+                if self._cooldown_active(entry):
                     continue
                 entry.active_requests += 1
                 if is_stream:
@@ -238,7 +243,7 @@ class TokenPool:
         for entry in self._candidate_entries(model=None, exclude_account_ids=set()):
             if not entry.account.enabled or entry.account.reauth_required or entry.removed:
                 continue
-            if entry.cooldown_until > time.time():
+            if self._cooldown_active(entry):
                 continue
             try:
                 await self._prepare_entry(entry, model=None)
@@ -272,12 +277,12 @@ class TokenPool:
         healthy = [
             entry
             for entry in enabled_entries
-            if not entry.account.reauth_required and entry.cooldown_until <= now
+            if not entry.account.reauth_required and not self._cooldown_active(entry, now=now)
         ]
         cooling_down = [
             entry
             for entry in enabled_entries
-            if entry.cooldown_until > now and not entry.account.reauth_required
+            if self._cooldown_active(entry, now=now) and not entry.account.reauth_required
         ]
         reauth = [entry for entry in enabled_entries if entry.account.reauth_required]
         return {
@@ -526,7 +531,7 @@ class TokenPool:
                 return RetryDecision(retry_other_account=True, reauth_required=True)
             if status_code == 429:
                 retry_after = exc.response.headers.get("retry-after", "").strip()
-                cooldown = float(retry_after) if retry_after.isdigit() else POOL_429_COOLDOWN
+                cooldown = self._rate_limit_cooldown(retry_after)
                 await self._cooldown(entry, cooldown, str(exc))
                 return RetryDecision(retry_other_account=True, cooldown_seconds=cooldown)
             if status_code in {500, 502, 503, 504}:
@@ -553,21 +558,82 @@ class TokenPool:
     async def _mark_success(self, entry: PoolEntry) -> None:
         entry.error_streak = 0
         entry.cooldown_until = 0.0
+        entry.account.cooldown_until = 0.0
         self.repository.mark_account(
             entry.account.account_id,
             reauth_required=False,
             last_used_at=time.time(),
             last_error="",
             last_error_at=0.0,
+            cooldown_until=0.0,
         )
 
     async def _cooldown(self, entry: PoolEntry, seconds: float, message: str) -> None:
         entry.error_streak += 1
-        entry.cooldown_until = time.time() + max(seconds, 0)
+        now = time.time()
+        cooldown_until = now + max(seconds, 0)
+        entry.cooldown_until = cooldown_until
+        entry.account.cooldown_until = cooldown_until
+        last_rate_limited_at = entry.account.last_rate_limited_at
+        if self._looks_rate_limited(message):
+            last_rate_limited_at = now
+            entry.account.last_rate_limited_at = now
         self.repository.mark_account(
             entry.account.account_id,
             last_error=message,
-            last_error_at=time.time(),
+            last_error_at=now,
+            cooldown_until=cooldown_until,
+            last_rate_limited_at=last_rate_limited_at,
+        )
+
+    def _cooldown_active(self, entry: PoolEntry, *, now: float | None = None) -> bool:
+        current_time = time.time() if now is None else now
+        cooldown_until = max(entry.cooldown_until, entry.account.cooldown_until)
+        entry.cooldown_until = cooldown_until
+        return cooldown_until > current_time
+
+    def _rate_limit_cooldown(self, retry_after: str) -> float:
+        retry_after = retry_after.strip()
+        if retry_after:
+            try:
+                cooldown = float(retry_after)
+            except ValueError:
+                pass
+            else:
+                if math.isfinite(cooldown) and cooldown >= 0.0:
+                    return cooldown
+            try:
+                retry_at = parsedate_to_datetime(retry_after)
+            except (TypeError, ValueError, IndexError, OverflowError):
+                retry_at = None
+            if retry_at is not None:
+                if retry_at.tzinfo is None:
+                    retry_at = retry_at.replace(tzinfo=timezone.utc)
+                return max(retry_at.timestamp() - time.time(), 0.0)
+        if self._healthy_enabled_account_count() <= 1:
+            return float(POOL_SINGLE_ACCOUNT_429_COOLDOWN)
+        return float(POOL_429_COOLDOWN)
+
+    def _healthy_enabled_account_count(self) -> int:
+        return sum(
+            1
+            for entry in self.entries.values()
+            if entry.account.enabled and not entry.account.reauth_required and not entry.removed
+        )
+
+    @staticmethod
+    def _looks_rate_limited(message: str) -> bool:
+        lowered = message.lower()
+        return any(
+            marker in lowered
+            for marker in (
+                " 429",
+                "rate limit",
+                "rate-limit",
+                "rate_limited",
+                "too many requests",
+                "token usage",
+            )
         )
 
 
